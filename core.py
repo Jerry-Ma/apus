@@ -280,6 +280,8 @@ def configure(config, args):
     config.am_params = getattr(config, 'am_params', {})
     config.log_file = getattr(config, 'log_file',
                               '{0}.log'.format(config.jobkey))
+    config.history_file = getattr(config, 'history_file',
+                              '{0}.ruffus'.format(config.jobkey))
 
     # ruffus options, some will be synchronized to config:
     # log_file, ...
@@ -301,7 +303,7 @@ def configure(config, args):
     parser.set_defaults(
             verbose=['0', ],
             log_file=config.log_file,
-            history_file='{0}.ruffus'.format(config.jobkey)
+            history_file=config.history_file
             )
     option = parser.parse_args(args)
     # handle logging
