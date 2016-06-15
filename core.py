@@ -343,6 +343,7 @@ def bootstrap():
         else:
             build(config, option)
     elif option.action == 'init':
+        option.history_file = option.history_file + '.init'
         init(config, option)
 
     # handle redo-all
