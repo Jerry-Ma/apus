@@ -21,7 +21,7 @@ confdir = os.path.join(jobdir, 'config')
 
 inputs = ["../stackpipe_old/test_images/*.fits", ]
 input_reg = r'.+/(?P<imgkey>\d+p)\.fits'
-input_out = os.path.join(jobdir, '{imgkey[0]}.fits')
+input_fmt = os.path.join(jobdir, '{imgkey[0]}.fits')
 
 extra_dir = '/home/ma/Codes/CFHT/ancillary'
 extra = [
@@ -29,7 +29,7 @@ extra = [
         # os.path.join(extra_dir, 'megacam.ret'),
         ]
 extra_reg = r'.+/(?P<exkey>[A-Za-z]+)(\w+)?\..+'
-extra_out = os.path.join(confdir, '{exkey[0]}{ext[0]}')
+extra_fmt = os.path.join(confdir, '{exkey[0]}{ext[0]}')
 
 
 # function that takes input, and returns (extra, extra_link_name)

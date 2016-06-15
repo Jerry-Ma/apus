@@ -29,7 +29,7 @@ and `swarp`)
 
     # define symbolic linking rules for the original input files
     input_reg, [extra_reg, ...]     # regex for parsing the filename
-    input_out, [extra_out, ...]     # fmt string for symlink target
+    input_fmt, [extra_fmt, ...]     # fmt string for symlink target
 
     # define astromatic configuration files to dump
     [am_sharedir, am_diagdir, am_resampdir, ...]  # directories
