@@ -28,6 +28,7 @@ from ruffus.proxy_logger import make_shared_logger_and_proxy
 from ruffus import mkdir
 from ruffus import Pipeline
 from ruffus import formatter
+from ruffus import inputs
 from ruffus import output_from
 from ruffus.ruffus_exceptions import error_ambiguous_task
 import env
@@ -35,7 +36,7 @@ import utils
 import func
 
 
-def ensure_list(value, tuple_as_list=True):
+def ensure_list(value, tuple_as_list=False):
     if tuple_as_list:
         listclass = (list, tuple)
         elemclass = (str, dict)
@@ -54,14 +55,14 @@ def ensure_list(value, tuple_as_list=True):
     return value
 
 
-def ensure_args_as_list(*iargs):
+def ensure_args_as_list(*iargs, **ikwargs):
     """wrap string argument as list"""
     def wrapper(func):
         @wraps(func)
         def wrapped_func(*args, **kwargs):
             newargs = list(args)
             for i in iargs:
-                newargs[i] = ensure_list(args[i], tuple_as_list=True)
+                newargs[i] = ensure_list(args[i], **ikwargs)
             return func(*newargs, **kwargs)
         return wrapped_func
     return wrapper
@@ -156,25 +157,6 @@ def configure(config, args):
     apusconf.slice_test = option.slice_test
     # handle dryrun
     apusconf.dry_run = option.dry_run
-    # inputs = []
-    # for glob_pattern in apusconf.inputs:
-    #     inputs.extend(glob.glob(glob_pattern))
-    # if not inputs:
-    #     raise RuntimeError('no input files could be found, exit')
-    # else:
-    #     inputs = list(set(map(os.path.abspath, inputs)))
-    #     logger.info('input files (total {0}):'.format(len(inputs)))
-    #     # handle slice
-    #     if option.slice_input != 'none':
-    #         _inputs = []
-    #         for l, r in option.slice_input:
-    #             _inputs.extend(inputs[l:r])
-    #         inputs = list(set(_inputs))
-    #         logger.info('sliced as {0} ({1}):'.format(
-    #             ' '.join(map(str, option.slice_input)), len(inputs)))
-    #     apusconf.inputs = inputs
-    #     for i in apusconf.inputs:
-    #         logger.info('{0}'.format(i))
 
     return apusconf, option
 
@@ -182,7 +164,7 @@ def configure(config, args):
 def get_task_func(func):
     errmsg = 'not a meaningful task func value: {0}'.format(func)
     if isinstance(func, str):
-        if func.lower in ['sextractor', 'sex', 'scamp', 'swarp']:
+        if func.lower() in ['sextractor', 'sex', 'scamp', 'swarp']:
             return astromatic_task
         else:
             command = func.split()
@@ -232,7 +214,9 @@ def create_ruffus_task(pipe, config, task, **kwargs):
     """create Ruffus task from the task dictionary and add to pipe
 
     keys: name, func, pipe, [in_, out]
-    optional keys: allow_slice, add_inputs, allow_finish_silently, dry_run
+    optional task keys: add_inputs, replace_inputs,
+                        allow_slice, in_keys, out_keys,
+    optional context keys: allow_finish_silently, dry_run
     """
 
     # validate the task dict first
@@ -241,6 +225,20 @@ def create_ruffus_task(pipe, config, task, **kwargs):
         if all(k not in task.keys() for k in ensure_list(key)):
             raise RuntimeError(missingkeyerror.format(key))
     config.__dict__.update(**kwargs)
+
+    # context is parameters that are passed to the task function
+    context_exclude_task_keys = [
+            'pipe', 'in_', 'out', 'add_inputs', 'allow_slice']
+    context_key_defaults = {
+            'allow_finish_silently': False,
+            'dry_run': config.dry_run,
+            }
+    context = {k: v for k, v in task.items() + context_key_defaults.items()
+               if k not in context_exclude_task_keys}
+    for key, defval in context_key_defaults.items():
+        context[key] = task.get(key, defval)
+
+    # process task dict
     task_name_list = config.get_task_names()
 
     pipe_func = getattr(pipe, task['pipe'])
@@ -300,19 +298,20 @@ def create_ruffus_task(pipe, config, task, **kwargs):
             task_kwargs['input'] = unwrap_if_len_one(task_inputs)
         if task['pipe'] != 'merge':  # require formatter for non-merge pipe
             task_kwargs['filter'] = formatter(*task_formatters)
-    # handle additional inputs
-    task_add_inputs = []
-    for in_ in ensure_list(task.get('add_inputs', None)):
-        if in_ in task_name_list:
-            try:  # have to replace task name with task
-                in_, = pipe.lookup_task_from_name(in_, "__main__")
-            except (ValueError, error_ambiguous_task):
-                pass
-        if isinstance(in_, str) and not os.path.isabs(in_):
-            in_ = os.path.join(config.task_io_default_dir, in_)
-        task_add_inputs.append(in_)
-    if len(task_add_inputs) > 0:
-        task_kwargs['add_inputs'] = tuple(task_add_inputs)  # ruffus req.
+    # handle additional inputs and replace_inputs
+    for inkey in ['add_inputs', 'replace_inputs']:
+        task_inkey = []
+        for in_ in ensure_list(task.get(inkey, None)):
+            if in_ in task_name_list:
+                try:  # have to replace task name with task
+                    in_, = pipe.lookup_task_from_name(in_, "__main__")
+                except (ValueError, error_ambiguous_task):
+                    pass
+            if isinstance(in_, str) and not os.path.isabs(in_):
+                in_ = os.path.join(config.task_io_default_dir, in_)
+            task_inkey.append(in_)
+        if len(task_inkey) > 0:
+            task_kwargs[inkey] = inputs(task_inkey)  # ruffus req.
     # handle outputs
     task_output = []
     for out in ensure_list(task.get('out', None)):
@@ -325,34 +324,38 @@ def create_ruffus_task(pipe, config, task, **kwargs):
         task_kwargs['output'] = os.path.join(
             config.task_io_default_dir,
             task_name.replace(' ', '_') + '.success')
-    # handle extras
-    # context is passed to the task function
-    non_context_keys = ['pipe', 'in_', 'out', 'add_inputs', 'allow_slice']
-    context = {k: v for k, v in task.items() if k not in non_context_keys}
-    context['dry_run'] = task.get('dry_run', config.dry_run)
-    context['allow_finish_silently'] = task.get('allow_finish_silently', False)
-    task_extras = {
+    # handle context as extra
+    task_extras = []
+    for extra in ensure_list(task.get('extras', None)):
+        if isinstance(extra, str) and not os.path.isabs(extra):
+            task_extras.append(os.path.join(config.task_io_default_dir, extra))
+        else:
+            task_extras.append(extra)
+    task_context = {
             'task': context,
             'logger': config.logger,
             'logger_mutex': config.logger_mutex,
             }
-    # have to wrap in a list per requirement of ruffus
-    task_kwargs['extras'] = [task_extras, ]
+    task_extras.append(task_context)
+    task_kwargs['extras'] = task_extras
     # create ruffus task
     ruffus_task = pipe_func(*task_args, **task_kwargs)
     # handle follows
     task_follows = [t['name'] if isinstance(t, dict) else t
                     for t in ensure_list(task.get('follows', []))]
-    # additional follows for astromatic task
-    if task_func.__name__ == 'astromatic_task':
+    # additional follows for astromatic task if no input config is supplied
+    if task_func.__name__ == 'astromatic_task' and \
+            'conf_file' not in ensure_list(task.get('in_keys', None)):
         pre_task = {
                 'name': 'config {0}'.format(task_name),
                 'func': func.dump_config_files,
                 'pipe': 'originate',
-                'out': 'conf.{0}'.format(task_name.replace(' ', '_')),
+                'out': os.path.join(config.confdir, 'conf.{0}'.format(
+                        task_name.replace(' ', '_'))),
                 'params': task['params']
                 }
-        task_follows.append(create_ruffus_task(pipe, config, pre_task))
+        task_follows.append(create_ruffus_task(
+            pipe, config, pre_task, task_io_default_dir=''))
     if len(task_follows) > 0:
         ruffus_task.follows(*task_follows)
     # add finish signal
@@ -873,77 +876,125 @@ def documented_subprocess_call(command, flag=None):
 
 
 @ensure_args_as_list(0, 1)
-def astromatic_task(in_files, out_files, task, logger, logger_mutex):
+def astromatic_task(in_files, out_files, *extras):
     """create astromatic command to run by subprocess"""
-    task = dict(task, func=get_astromatic_callable(in_files, out_files, task))
-    return callable_task(in_files, out_files, task, logger, logger_mutex)
+    in_files.extend(extras[:-1])
+    context = extras[-1]
+    task = dict(context['task'], func=get_astromatic_callable(
+            in_files, out_files, context))
+    return callable_task(in_files, out_files, dict(context, task=task))
 
 
-def get_astromatic_callable(in_files, out_files, task):
+def get_astromatic_callable(in_files, out_files, context):
     """return the command for executing astromatic task"""
     out_files, flag = get_flagfile(out_files)
-    program = get_amprog(task['func'])
-    command = [env.am['{0}bin'.format(program)], '-c', task['conffile'], ]
-    params = task.get('params', {})
+    task = context['task']
+    # get program
+    program = [i for i in ['sex', 'scamp', 'swarp']
+               if task['func'].lower().startswith(i)][0]
+    # split up inputs types
+    inputs = []
+    conf_file = []
+    conf_overrides = []
+    keyword_overrides = []
+    for key, val in zip(task.get('in_keys', ['in', ]), in_files):
+        val = ensure_list(val)
+        if key == 'in':
+            inputs.extend(val)
+        elif key == 'conf_file':
+            conf_file.extend(val)
+        elif key == 'conf_overrides':
+            conf_overrides.extend(val)
+        else:
+            keyword_overrides.append('-{0} {1}'.format(key, ', '.join(val)))
+    # build command
+    if len(conf_file) != 1:
+        raise RuntimeError('no configuration file specified for {0}'
+                           .format(task['func']))
+    # FIXME need better handle inputs
+    inputs = unwrap_if_len_one(inputs)
+    if isinstance(inputs, tuple):
+        inputs = list(inputs)
+    command = [env.am['{0}bin'.format(program)], '-c', conf_file[0]] + inputs
+    # handle param overrides
+    params = utils.parse_astromatic_conf(*conf_overrides)
+    params.update(dict(keyword_overrides))
+    for key, val in params.items():
+        command.extend(['-{0}'.format(key), '"{0}"'.format(val)])
+    # handle outkeys
+    default_outkeys = {
+            'sex': ['CATALOG_NAME', ],
+            'scamp': [],
+            'swarp': ['IMAGEOUT_NAME', 'WEIGHTOUT_NAME']
+            }
+    out_keys = task.get('out_keys', default_outkeys[program])
+    for i, key in enumerate(out_keys):
+        command.extend(['-{0}'.format(key), out_files[i]])
+
     # handle out_files
-    if program == 'sex':
-        outkey = ensure_list(task.get('outkey', 'CATALOG_NAME'))
-    elif program == 'scamp':
-        outkey = ensure_list(task.get('outkey', {}))
-        # handle output catalog name suffix
-        if len(outkey) == 1 and outkey[0] == 'MERGEDOUTCAT_NAME':
-            flag = out_files[0]
-    elif program == 'swarp':
-        if len(out_files) == 1:
-            out_files.append(out_files[0].replace('.fits', '.weight.fits'))
-        outkey = ensure_list(task.get('outkey',
-                             ['IMAGEOUT_NAME', 'WEIGHTOUT_NAME']))
-    for i, key in enumerate(outkey):
-        command.extend(['-' + key, out_files[i]])
+    # if program == 'sex':
+    #     outkey = ensure_list(task.get('outkey', 'CATALOG_NAME'))
+    # elif program == 'scamp':
+    #     outkey = ensure_list(task.get('outkey', {}))
+    #     # handle output catalog name suffix
+    #     if len(outkey) == 1 and outkey[0] == 'MERGEDOUTCAT_NAME':
+    #         flag = out_files[0]
+    # elif program == 'swarp':
+    #     if len(out_files) == 1:
+    #         out_files.append(out_files[0].replace('.fits', '.weight.fits'))
+    #     outkey = ensure_list(task.get('outkey',
+    #                          ['IMAGEOUT_NAME', 'WEIGHTOUT_NAME']))
+    # for i, key in enumerate(outkey):
+    #     command.extend(['-' + key, out_files[i]])
     # handle multiple in_files
     # scheme: [dectect] image [weight1, weight2, ...]
-    if program == 'sex':
-        if params.get('WEIGHT_TYPE', 'NONE') != 'NONE':
-            n_weight = len(params['WEIGHT_TYPE'].split(','))
-            weight = ensure_list(params.pop('WEIGHT_IMAGE', []))
-            while len(weight) < n_weight:
-                weight.insert(0, in_files.pop())
-            command.extend(['-WEIGHT_IMAGE', ','.join(weight)])
-    elif program == 'scamp':
-        if params.get('ASTREF_CATALOG', None) is not None and \
-                params['ASTREF_CATALOG'] == 'FILE':
-            # the last input is the catalog key
-            refcatkey = in_files.pop()
-            command.extend(['-ASTREFCAT_NAME', refcatkey])
-    elif program == 'swarp':
-        # input looks like [[], [], ...]
-        # [img, wht, head]
-        _in_files = zip(*in_files)
-        if params.get('WEIGHT_TYPE', 'NONE') != 'NONE':
-            img, wht = _in_files[:2]
-            hdr = _in_files[2] if len(_in_files) > 2 else None
-        else:
-            img, wht = _in_files[0], None
-            hdr = _in_files[1] if len(_in_files) > 1 else None
-        in_files = img
-        if wht is not None:
-            command.extend(['-WEIGHT_IMAGE', ','.join(wht)])
-        if hdr is not None:  # create sym link
-            for (i, h) in zip(img, hdr):
-                lnh = '{0}{1}'.format(os.path.splitext(i)[0],
-                                      params.get('HEADER_SUFFIX', '.head'))
-                subprocess.call(['ln', '-sf', os.path.abspath(h), lnh])
-    for k, v in params.items():
-        command.extend(['-{0}'.format(k), v])
-    command.extend(in_files)
+    # if program == 'sex':
+    #     if params.get('WEIGHT_TYPE', 'NONE') != 'NONE':
+    #         n_weight = len(params['WEIGHT_TYPE'].split(','))
+    #         weight = ensure_list(params.pop('WEIGHT_IMAGE', []))
+    #         while len(weight) < n_weight:
+    #             weight.insert(0, in_files.pop())
+    #         command.extend(['-WEIGHT_IMAGE', ','.join(weight)])
+    # elif program == 'scamp':
+    #     if params.get('ASTREF_CATALOG', None) is not None and \
+    #             params['ASTREF_CATALOG'] == 'FILE':
+    #         # the last input is the catalog key
+    #         refcatkey = in_files.pop()
+    #         command.extend(['-ASTREFCAT_NAME', refcatkey])
+    # elif program == 'swarp':
+    #     # input looks like [[], [], ...]
+    #     # [img, wht, head]
+    #     _in_files = zip(*in_files)
+    #     if params.get('WEIGHT_TYPE', 'NONE') != 'NONE':
+    #         img, wht = _in_files[:2]
+    #         hdr = _in_files[2] if len(_in_files) > 2 else None
+    #     else:
+    #         img, wht = _in_files[0], None
+    #         hdr = _in_files[1] if len(_in_files) > 1 else None
+    #     in_files = img
+    #     if wht is not None:
+    #         command.extend(['-WEIGHT_IMAGE', ','.join(wht)])
+    #     if hdr is not None:  # create sym link
+    #         for (i, h) in zip(img, hdr):
+    #             lnh = '{0}{1}'.format(os.path.splitext(i)[0],
+    #                                   params.get('HEADER_SUFFIX', '.head'))
+    #             subprocess.call(['ln', '-sf', os.path.abspath(h), lnh])
+    # for k, v in params.items():
+    #     command.extend(['-{0}'.format(k), v])
+    # command.extend(in_files)
     return documented_subprocess_call(command, flag=flag)
 
 
 @ensure_args_as_list(0, 1)
-def subprocess_task(in_files, out_files, context):
-    """run command as subprocess"""
+def subprocess_task(in_files, out_files, *extras):
+    """run command as subprocess by replacing func key in task context
+    with callable
+    extras: extra inputs, task context
+    """
+    in_files.extend(extras[:-1])
+    context = extras[-1]
     task = dict(context['task'], func=get_subprocess_callable(
-        in_files, out_files, context))
+            in_files, out_files, context))
     return callable_task(in_files, out_files, dict(context, task=task))
 
 
@@ -959,7 +1010,9 @@ def get_subprocess_callable(in_files, out_files, context):
 
 
 @ensure_args_as_list(0, 1)
-def callable_task(in_files, out_files, context):
+def callable_task(in_files, out_files, *extras):
+    in_files.extend(extras[:-1])
+    context = extras[-1]
     task, logger, logger_mutex = [
             context[i] for i in ['task', 'logger', 'logger_mutex']]
     func = task['func']

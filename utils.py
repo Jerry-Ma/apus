@@ -56,6 +56,21 @@ def get_scamp_checkplot_name(dirname, prefix=''):
                      for i in scamp_checkplot])
 
 
+def parse_astromatic_conf(*conf_files):
+    params = {}
+    for fname in conf_files:
+        with open(fname, 'r') as fo:
+            for ln in fo.readlines():
+                ln = ln.strip()
+                if ln == '' or ln.startswith('#'):
+                    continue
+                else:
+                    key, rest = map(str.strip, ln.split(None, 1))
+                    value = rest.split('#')[0]
+                    params[key] = value
+    return params
+
+
 def dump_astromatic_conf(infile, outfile, clobber=False, **kwargs):
 
     logger = logging.getLogger(__name__)

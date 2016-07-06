@@ -54,3 +54,11 @@ def create_symbolic_link(in_file, out_file, **kwargs):
         except Exception as e:
             log('info', 'cannot unlink {0}: {1}'.format(out_file, e))
     os.symlink(os.path.relpath(in_file, out_dir), out_file)
+
+
+def dump_config_files(out_file, **kwargs):
+    """create configuration file"""
+
+    log = get_log_func(**kwargs)
+    log('info', 'dump configuration {0}'.format(out_file))
+    print kwargs['params']
