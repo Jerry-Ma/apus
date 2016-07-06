@@ -11,6 +11,7 @@ core.py
 
 from __future__ import print_function
 import os
+import re
 import sys
 import glob
 import time
@@ -19,6 +20,8 @@ import StringIO
 import subprocess
 from functools import wraps    # enable pickling of decorator
 from datetime import timedelta
+# from collections import Iterable
+
 import ruffus
 import ruffus.cmdline as cmdline
 from ruffus.proxy_logger import make_shared_logger_and_proxy
@@ -29,43 +32,434 @@ from ruffus import output_from
 from ruffus.ruffus_exceptions import error_ambiguous_task
 import env
 import utils
+import func
 
 
-def create_symlink(in_file, out_file, per_file_extra, logger, logger_mutex):
-    """Link original data to work directory
+def ensure_list(value, tuple_as_list=True):
+    if tuple_as_list:
+        listclass = (list, tuple)
+        elemclass = (str, dict)
+    else:
+        listclass = list
+        elemclass = (str, tuple, dict)
+    if isinstance(value, elemclass) or callable(value):
+        value = [value, ]
+    elif value is None:
+        value = []
+    elif isinstance(value, listclass):
+        pass
+    else:
+        raise RuntimeError("not able to ensure list type for {0}"
+                           .format(value))
+    return value
 
-    :in_file: filename of original file
-    :out_file: filename of symlink to create
-    :per_file_extra: list of functions to generate per file extra link
+
+def ensure_args_as_list(*iargs):
+    """wrap string argument as list"""
+    def wrapper(func):
+        @wraps(func)
+        def wrapped_func(*args, **kwargs):
+            newargs = list(args)
+            for i in iargs:
+                newargs[i] = ensure_list(args[i], tuple_as_list=True)
+            return func(*newargs, **kwargs)
+        return wrapped_func
+    return wrapper
+
+
+def unwrap_if_len_one(arg):
+    return arg if len(arg) > 1 else arg[0]
+
+
+class ApusConfig(object):
+    """interfacing the input config module"""
+
+    dirs = [
+        ('jobdir', None), ('confdir', '{jobdir:s}'), ('diagdir', '{jobdir:s}'),
+        ('task_io_default_dir', '{jobdir:s}')
+        ]
+    specs = [('jobkey', None), ('inputs', []), ('tlist', [])]
+    runtime = [
+        ('env_overrides', {}), ('slice_test', None),
+        ('logger', None), ('logger_mutex', None),
+        ('log_file', '{jobkey:s}.log'), ('history_file', '{jobkey:s}.ruffus')
+        ]
+
+    def __init__(self, config):
+        missingkeyerror = "missing key in config module: {0}"
+        for key, defval in self.dirs + self.specs + self.runtime:
+            try:
+                val = getattr(config, key)
+            except AttributeError:
+                if defval is None and key not in dict(self.runtime).keys():
+                    raise RuntimeError(missingkeyerror.format(key))
+                elif isinstance(defval, str):
+                    val = defval.format(**self.__dict__)
+                else:
+                    val = defval
+            setattr(self, key, val)
+
+    def get_dirs(self):
+        return list(set(getattr(self, k) for k in dict(self.dirs).keys()))
+
+    def get_task_names(self):
+        return [t['name'] for t in self.tlist]
+
+
+def configure(config, args):
+    """parse command line arguments, split the ruffus arguments from
+    config moduel items, provide additional command line shortcuts
+
+    :config: configuration module
+    :args: arguments supplied in commandline
+    :returns: ApusConfig object, argparse option object
+
     """
-    if per_file_extra is not None:
-        for func in per_file_extra:
-            in_, out = func(in_file)
-            create_symlink(in_, out, None, logger, logger_mutex)
-    with logger_mutex:
-        logger.info("symlink: {0} -> {1}".format(
-            os.path.relpath(os.path.abspath(in_file),
-                            os.path.abspath(os.path.dirname(out_file))),
-            out_file))
-    # Guard against soft linking to oneself
-    datadir = os.path.abspath(os.path.dirname(in_file))
-    workdir = os.path.abspath(os.path.dirname(out_file))
-    if datadir == workdir or in_file == out_file:
-        raise ValueError('work directory %s has to be different to '
-                         'protect the original data' % workdir)
-    if os.path.lexists(out_file):
-        # do not delete or overwrite real (non-soft link) file
-        if not os.path.islink(out_file):
-            raise ValueError("%s exists and is not a link" % out_file)
-        try:
-            os.unlink(out_file)
-        except Exception as e:
-            with logger_mutex:
-                logger.debug("can't unlink %s: %s" % (out_file, e))
-    # symbolic link relative to original directory so that the entire path
-    # can be moved around with breaking everything
-    os.symlink(os.path.relpath(os.path.abspath(in_file),
-               os.path.abspath(os.path.dirname(out_file))), out_file)
+    apusconf = ApusConfig(config)
+    parser = cmdline.get_argparse(description="""
++- Astronomy Pipeline Using ruffuS (script by Zhiyuan Ma) -+
+""", version=ruffus.__version__)
+    # additional options
+    parser.add_argument('action', nargs='?', default='run',
+                        choices=['init', 'run'],
+                        help='the action to take: initialize the pipeline'
+                             ' directory, or run the pipeline')
+    parser.add_argument(
+            '-r', '--redo-all', action='store_true',
+            help='force redo all tasks')
+    parser.add_argument(
+            '-d', '--dry-run', action='store_true',
+            help='perform low level dry run for debugging purpose')
+
+    def input_slice(string):
+        if '...' in string:
+            return map(int, string.split('...'))
+        elif string == 'none':
+            return None
+        else:  # single integer is slicing from 0
+            return [0, int(string)]
+    parser.add_argument(
+            '-s', '--slice-test', nargs='+', default='none', type=input_slice,
+            help='run a slice of inputs for testing purpose')
+    parser.set_defaults(
+            verbose=['0', ],
+            log_file=apusconf.log_file,
+            history_file=apusconf.history_file
+            )
+    option = parser.parse_args(args)
+    # handle logger
+    logger, logger_mutex = make_shared_logger_and_proxy(
+            logger_factory, apusconf.jobkey, [option.log_file, option.verbose])
+    apusconf.logger = logger
+    apusconf.logger_mutex = logger_mutex
+    # handle slice test: override expand glob and slice on creating task
+    apusconf.slice_test = option.slice_test
+    # handle dryrun
+    apusconf.dry_run = option.dry_run
+    # inputs = []
+    # for glob_pattern in apusconf.inputs:
+    #     inputs.extend(glob.glob(glob_pattern))
+    # if not inputs:
+    #     raise RuntimeError('no input files could be found, exit')
+    # else:
+    #     inputs = list(set(map(os.path.abspath, inputs)))
+    #     logger.info('input files (total {0}):'.format(len(inputs)))
+    #     # handle slice
+    #     if option.slice_input != 'none':
+    #         _inputs = []
+    #         for l, r in option.slice_input:
+    #             _inputs.extend(inputs[l:r])
+    #         inputs = list(set(_inputs))
+    #         logger.info('sliced as {0} ({1}):'.format(
+    #             ' '.join(map(str, option.slice_input)), len(inputs)))
+    #     apusconf.inputs = inputs
+    #     for i in apusconf.inputs:
+    #         logger.info('{0}'.format(i))
+
+    return apusconf, option
+
+
+def get_task_func(func):
+    errmsg = 'not a meaningful task func value: {0}'.format(func)
+    if isinstance(func, str):
+        if func.lower in ['sextractor', 'sex', 'scamp', 'swarp']:
+            return astromatic_task
+        else:
+            command = func.split()
+            if '{in}' in command or '{out}' in command:
+                return subprocess_task
+            else:
+                raise RuntimeError(errmsg)
+    elif callable(func):
+        return callable_task
+    else:
+        raise RuntimeError(errmsg)
+
+
+def aggregate_task_inputs(input_, validate_tuple_num_elem=2):
+    formatter_inputs = []
+    simple_inputs = []
+    generator_inputs = []
+    for in_ in input_:
+        if callable(in_):
+            generator_inputs.append(in_)
+        elif isinstance(in_, tuple) and len(in_) == validate_tuple_num_elem:
+            if callable(in_[0]):
+                raise RuntimeError('generator input should not have formatter'
+                                   ' {0}'.format(in_))
+            formatter_inputs.append(in_)
+        elif isinstance(in_, list):
+            simple_inputs.extend(in_)
+        elif isinstance(in_, (str, dict)):
+            simple_inputs.append(in_)
+        else:
+            raise RuntimeError('invalid input {0}'.format(in_))
+    if len(generator_inputs) > 1:
+        raise RuntimeError('found multiple generator inputs {0}'.format(
+            generator_inputs))
+    return formatter_inputs, simple_inputs, generator_inputs
+
+
+def sliced_glob(pattern, slice_ranges):
+    ret = []
+    files = glob.glob(pattern)
+    for l, r in slice_ranges:
+        ret.extend(files[l:r])
+    return list(set(ret))
+
+
+def create_ruffus_task(pipe, config, task, **kwargs):
+    """create Ruffus task from the task dictionary and add to pipe
+
+    keys: name, func, pipe, [in_, out]
+    optional keys: allow_slice, add_inputs, allow_finish_silently, dry_run
+    """
+
+    # validate the task dict first
+    missingkeyerror = "missing key in task dict: {0}"
+    for key in ['name', 'func', 'pipe', ['in_', 'out']]:
+        if all(k not in task.keys() for k in ensure_list(key)):
+            raise RuntimeError(missingkeyerror.format(key))
+    config.__dict__.update(**kwargs)
+    task_name_list = config.get_task_names()
+
+    pipe_func = getattr(pipe, task['pipe'])
+    task_name = task['name']
+    task_func = get_task_func(task['func'])
+
+    task_args = []
+    task_kwargs = {'name': task_name, 'task_func': task_func}
+
+    # handle input
+    formatter_inputs, simple_inputs, generator_inputs = aggregate_task_inputs(
+            ensure_list(task['in_'], tuple_as_list=False))
+    if len(generator_inputs) > 0:  # generator_inputs goes to unnamed argument
+            task_args.extend(generator_inputs)
+    # simple_inputs get common general formatter
+    if len(simple_inputs) > 0:
+        formatter_inputs.append((simple_inputs, r'.+'))
+    # handle formatter_inputs
+    task_inputs = []
+    task_formatters = []
+    for in_, reg in formatter_inputs:
+        in_ = [i['name'] if isinstance(i, dict) else i
+               for i in ensure_list(in_)]
+        temp_in = []
+        temp_reg = reg
+        for i in in_:
+            if i in task_name_list:
+                temp_in.append(output_from(i))
+                continue
+            elif not os.path.isabs(i):  # prepend default io dir
+                i = os.path.join(config.task_io_default_dir, i)
+                temp_reg = r'(?:[^/]*/)*' + reg
+            if re.search(r'[?*,\[\]{}]', i) is not None:
+                # slice on flagged task
+                if config.slice_test is not None \
+                        and task.get('allow_slice', False):
+                    config.logger.info(
+                            'sliced glob input: {0} @ {1}'.format(
+                                i, ', '.join(map(str, config.slice_test))))
+                    sliced_files = sliced_glob(i, config.slice_test)
+                    if len(sliced_files) == 0:
+                        raise RuntimeError('no input left after slicing')
+                    for f in sliced_files:
+                        config.logger.info(' {0}'.format(f))
+                    temp_in.extend(sliced_files)
+                else:
+                    config.logger.info('glob input: {0}'.format(i))
+                    temp_in.append(i)
+            else:
+                config.logger.info('file input: {0}'.format(i))
+                temp_in.append(i)
+        task_inputs.append(temp_in)  # list of list
+        task_formatters.append(temp_reg)  # list of regex
+    if len(task_inputs) > 0:
+        task_inputs = reduce(lambda a, b: a + b, task_inputs)  # flatten
+        if len(task_inputs) > 0:
+            task_kwargs['input'] = unwrap_if_len_one(task_inputs)
+        if task['pipe'] != 'merge':  # require formatter for non-merge pipe
+            task_kwargs['filter'] = formatter(*task_formatters)
+    # handle additional inputs
+    task_add_inputs = []
+    for in_ in ensure_list(task.get('add_inputs', None)):
+        if in_ in task_name_list:
+            try:  # have to replace task name with task
+                in_, = pipe.lookup_task_from_name(in_, "__main__")
+            except (ValueError, error_ambiguous_task):
+                pass
+        if isinstance(in_, str) and not os.path.isabs(in_):
+            in_ = os.path.join(config.task_io_default_dir, in_)
+        task_add_inputs.append(in_)
+    if len(task_add_inputs) > 0:
+        task_kwargs['add_inputs'] = tuple(task_add_inputs)  # ruffus req.
+    # handle outputs
+    task_output = []
+    for out in ensure_list(task.get('out', None)):
+        if not os.path.isabs(out):
+            out = os.path.join(config.task_io_default_dir, out)
+        task_output.append(out)
+    if len(task_output) > 0:
+        task_kwargs['output'] = unwrap_if_len_one(task_output)
+    else:  # flag file for checkpointing
+        task_kwargs['output'] = os.path.join(
+            config.task_io_default_dir,
+            task_name.replace(' ', '_') + '.success')
+    # handle extras
+    # context is passed to the task function
+    non_context_keys = ['pipe', 'in_', 'out', 'add_inputs', 'allow_slice']
+    context = {k: v for k, v in task.items() if k not in non_context_keys}
+    context['dry_run'] = task.get('dry_run', config.dry_run)
+    context['allow_finish_silently'] = task.get('allow_finish_silently', False)
+    task_extras = {
+            'task': context,
+            'logger': config.logger,
+            'logger_mutex': config.logger_mutex,
+            }
+    # have to wrap in a list per requirement of ruffus
+    task_kwargs['extras'] = [task_extras, ]
+    # create ruffus task
+    ruffus_task = pipe_func(*task_args, **task_kwargs)
+    # handle follows
+    task_follows = [t['name'] if isinstance(t, dict) else t
+                    for t in ensure_list(task.get('follows', []))]
+    # additional follows for astromatic task
+    if task_func.__name__ == 'astromatic_task':
+        pre_task = {
+                'name': 'config {0}'.format(task_name),
+                'func': func.dump_config_files,
+                'pipe': 'originate',
+                'out': 'conf.{0}'.format(task_name.replace(' ', '_')),
+                'params': task['params']
+                }
+        task_follows.append(create_ruffus_task(pipe, config, pre_task))
+    if len(task_follows) > 0:
+        ruffus_task.follows(*task_follows)
+    # add finish signal
+    ruffus_task.posttask(task_finish_signal(task_name, config))
+    return ruffus_task
+
+
+def build_init_pipeline(config, option):
+    """pipeline to prepare directories and symbolic links for inputs
+
+    :config: configuration module
+    :option: commandline argument
+    :returns: pipeline object
+    """
+    pipe = Pipeline(name=config.jobkey + '.init')
+    t00 = {'name': 'make dirs'}
+    pipe.mkdir(config.get_dirs(), name=t00['name'])
+
+    # rectify the inputs
+    formatter_inputs, simple_inputs, _ = aggregate_task_inputs(
+            ensure_list(config.inputs), validate_tuple_num_elem=3)
+    if len(formatter_inputs) + len(simple_inputs) == 0:
+        raise RuntimeError('no input specified')
+    # create tasks
+    tlist = []
+    for i, (in_, reg, out) in enumerate(formatter_inputs):
+        name = 'link formatter inputs'
+        if i > 0:
+            name += ' {0}'.format(i + 1)
+        tlist.append({
+            'name': name,
+            'func': func.create_symbolic_link,
+            'pipe': 'transform',
+            'in_': (in_, reg),
+            'out': out,
+            'allow_finish_silently': True,
+            'allow_slice': True,
+            'follows': t00,
+            })
+    if len(simple_inputs) > 0:
+        tlist.append({
+            'name': 'link simple inputs',
+            'func': func.create_symbolic_link,
+            'pipe': 'transform',
+            'in_': simple_inputs,
+            'out': os.path.join(config.jobdir, '{basename[0]}{ext[0]}'),
+            'allow_finish_silently': True,
+            'follows': t00,
+            })
+    # t03 = {
+    #         'name': 'link per input extras',
+    #         'func': func.create_symbolic_link,
+    #         'type_': 'files',
+    #         'follows': t00['name'],
+    #         }
+    # def gen_per_input_extra():
+    #     for f in ensure_list(config.per_input_extra):
+    #         for in_ in config.inputs:
+    #             # @files doesn't propagate extra, so we pass them explicitly
+    #             yield list(f(in_)) + [t03, config.logger,
+    #                                   config.logger_mutex]
+    # t03['in_'] = gen_per_input_extra
+    for t in tlist:
+        create_ruffus_task(pipe, config, t, task_io_default_dir='')
+
+    return pipe
+
+
+def build_pipeline(config, option):
+    """assemble the job pipeline
+
+    :config: configuration module
+    :option: commandline argument
+    :returns: pipeline object
+    """
+    pipe = Pipeline(name=config.jobkey)
+    for task in config.tlist:
+        create_ruffus_task(pipe, config, task)
+    return pipe
+
+
+def bootstrap():
+    """entry point; parse command line argument, create pipeline object,
+    and run it
+    """
+    print("+- APUS powered by Ruffus ver {0} -+".format(ruffus.__version__))
+    config, option = configure(sys.modules['__main__'], sys.argv[1:])
+    # check existence of the jobdir
+    if option.action == 'run':
+        if not os.path.exists(config.jobdir):
+            raise RuntimeError('job directory does not exist,'
+                               ' run init to create one')
+        else:
+            build_pipeline(config, option)
+    elif option.action == 'init':
+        option.history_file = option.history_file + '.init'
+        build_init_pipeline(config, option)
+    # handle redo-all
+    if option.redo_all:
+        task_list = ruffus.pipeline_get_task_names()
+        option.forced_tasks.extend(task_list)
+    if len(option.forced_tasks) > 0:
+        for t in option.forced_tasks:
+            config.logger.info("forced redo: {0}".format(utils.alert(t)))
+    # mark the begin time
+    config.timestamp = time.time()
+    cmdline.run(option, checksum_level=1)
 
 
 def get_amprog(string):
@@ -137,7 +531,7 @@ def dump_configuration_files(flag_file, config):
             global_params[key] = dict(am_config_default(program),
                                       **am_params[key])
     for k, v in has_per_task_params.items():
-        if v == 0:
+        if v == 0 and k in global_params.keys():
             per_task_params[k] = global_params[k]
 
     # create configuration files and set up the path
@@ -201,6 +595,10 @@ class _Conf(object):
         self.__dict__.update(kwargs)
 
 
+def create_symlink():
+    pass
+
+
 def init(config, option):
     """prepare directories and files for the job
 
@@ -257,7 +655,7 @@ def build(config, option):
     return pipe
 
 
-def configure(config, args):
+def configure_(config, args):
     """parse commandline arguments, split the ruffus arguments from
     configuration items, also provide some shortcuts
 
@@ -281,7 +679,7 @@ def configure(config, args):
     config.log_file = getattr(config, 'log_file',
                               '{0}.log'.format(config.jobkey))
     config.history_file = getattr(config, 'history_file',
-                              '{0}.ruffus'.format(config.jobkey))
+                                  '{0}.ruffus'.format(config.jobkey))
 
     # ruffus options, some will be synchronized to config:
     # log_file, ...
@@ -331,7 +729,7 @@ def configure(config, args):
     return config, option
 
 
-def bootstrap():
+def bootstrap_():
     """parse commandline argument, create pipeline object, and run the job
 
     """
@@ -435,29 +833,6 @@ def task_finish_signal(task_name, config):
     return ret_task_finish_signal
 
 
-def ensure_list(value):
-    if isinstance(value, str):
-        value = [value, ]
-    elif value is None:
-        value = []
-    else:
-        value = list(value)
-    return value
-
-
-def ensure_args_as_list(*iargs):
-    """wrap string argument as list"""
-    def wrapper(func):
-        @wraps(func)
-        def wrapped_func(*args):
-            newargs = list(args)
-            for i in iargs:
-                newargs[i] = ensure_list(args[i])
-            return func(*newargs)
-        return wrapped_func
-    return wrapper
-
-
 @ensure_args_as_list(0)
 def touch_file(out_files):
     for out in out_files:
@@ -476,7 +851,7 @@ def get_flagfile(out_files):
 
 
 def documented_subprocess_call(command, flag=None):
-    def func(*args):
+    def func(*args, **kwargs):
         # handle scamp refcatalog suffix
         if '-ASTREFCAT_NAME' in command:
             ikey = command.index('-ASTREFCAT_NAME') + 1
@@ -565,15 +940,16 @@ def get_astromatic_callable(in_files, out_files, task):
 
 
 @ensure_args_as_list(0, 1)
-def subprocess_task(in_files, out_files, task, logger, logger_mutex):
+def subprocess_task(in_files, out_files, context):
     """run command as subprocess"""
-    task = dict(task, func=get_subprocess_callable(in_files, out_files, task))
-    return callable_task(in_files, out_files, task, logger, logger_mutex)
+    task = dict(context['task'], func=get_subprocess_callable(
+        in_files, out_files, context))
+    return callable_task(in_files, out_files, dict(context, task=task))
 
 
-def get_subprocess_callable(in_files, out_files, task):
+def get_subprocess_callable(in_files, out_files, context):
     out_files, flag = get_flagfile(out_files)
-    command = task['func'].split()
+    command = context['task']['func'].split()
     for key, value in zip(['{in}', '{out}'], [in_files, out_files]):
         if key in command:
             i = command.index(key)
@@ -583,23 +959,28 @@ def get_subprocess_callable(in_files, out_files, task):
 
 
 @ensure_args_as_list(0, 1)
-def callable_task(in_files, out_files, task, logger, logger_mutex):
+def callable_task(in_files, out_files, context):
+    task, logger, logger_mutex = [
+            context[i] for i in ['task', 'logger', 'logger_mutex']]
     func = task['func']
-    if not func.__doc__:  # append document for better debug
-        func.__doc__ = "{0}({1}, {2})".format(
-                func.__name__, in_files, out_files)
-    if task.get('dryrun', False):
-        output = '~dry~run~3~sec: {0}'.format(func.__doc__)
-        time.sleep(3)
-        touch_file(out_files)
+    mesg = "{0}({1}, {2})".format(func.__name__, in_files, out_files)
+    if func.__doc__:
+        mesg += ': {0}'.format(func.__doc__.split('\n')[0])
+    if task.get('dry_run', False):
+        output = '~dry~run~3~sec: {0}'.format(mesg)
+        time.sleep(1)
+        # touch_file(out_files)
     else:
-        with logger_mutex:
-            logger.debug('run: {0}'.format(func.__doc__))
-        output = func(in_files, out_files, task)
-    if not output:
+        # with logger_mutex:
+        #     logger.debug('run: {0}'.format(mesg))
+        kwargs = {'task': task, 'logger': logger, 'logger_mutex': logger_mutex}
+        output = func(in_files, out_files, **kwargs)
+    if not output and task.get('allow_finish_silently', False):
+        pass
+    else:
         output = "finished silently"
-    with logger_mutex:
-        logger.debug(output)
+        with logger_mutex:
+            logger.debug(output)
 
 
 def parse_task_func(func):
@@ -620,17 +1001,11 @@ def parse_task_func(func):
         raise RuntimeError(errmsg)
 
 
-def is_task_name(string):
-    """check string is task name"""
-    if '*' in string or '?' in string or '/' in string:
-        return False
-    elif os.path.isfile(string):
-        return False
-    else:
-        return True
+def is_task_name():
+    pass
 
 
-def create_ruffus_task(pipe, config, task):
+def create_ruffus_task_(pipe, config, task):
     """create Ruffus task from the task dictionary and add to pipe"""
     task_name = task['name']
 
@@ -640,19 +1015,24 @@ def create_ruffus_task(pipe, config, task):
         task['conffile'] = os.path.join(config.confdir, conffile)
 
     # handle dryrun
-    if config.dryrun:
-        task['dryrun'] = task.get('dryrun', True)
+    if config.dry_run:
+        task['dry_run'] = task.get('dry_run', True)
 
     pipe_func = getattr(pipe, task['type_'])
+    task_args = []
     task_kwargs = {
             'name': task_name,
-            'extras': [task, config.logger, config.logger_mutex]
+            'extras': [task, config.logger, config.logger_mutex],
             }
     # handle input
     _input = [output_from(i) if is_task_name(i) else i
               for i in ensure_list(task['in_'])]
     if len(_input) == 1:
-        task_kwargs['input'] = _input[0]
+        # handle @file, where geneartor should be unnamed arg
+        if callable(_input[0]):
+            task_args.append(_input[0])
+        else:
+            task_kwargs['input'] = _input[0]
     elif len(_input) > 1:
         task_kwargs['input'] = _input
     # handle filter
@@ -678,7 +1058,7 @@ def create_ruffus_task(pipe, config, task):
     else:  # flag file for checkpointing
         task_kwargs['output'] = os.path.join(
                 config.jobdir, task_name.replace(' ', '_') + '.success')
-    tt = pipe_func(task_func, **task_kwargs)
+    tt = pipe_func(task_func, *task_args, **task_kwargs)
     # handle follows
     if task.get('follows', None) is not None:
         tt.follows(*ensure_list(task['follows']))

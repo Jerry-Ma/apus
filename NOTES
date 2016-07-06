@@ -1,0 +1,43 @@
+# Modularized pipeline
+
+    Pipeline tasks can be grouped together, e.g.
+
+        astromatic preset:
+            generate config -> run -> convert output
+
+# flexible input, output for astromatic
+
+    inputs could be catalogs, or refcat, or any other parameters
+
+# DRMAA dispatcher for scripts
+
+    If task is running though subprocess, it also could be dispatched
+    to cluster resources via DRMAA
+
+# callable functions module
+# config file refractor
+
+    define input, per_input_extra, extra
+
+    > .. init: create the sym links -> generate parameter file
+
+
+# specifications of describing a task
+
+    use a single dict
+    close to nature language:
+
+    keys:
+        name, func, type_, in_, out_
+
+    inputs could be
+        taskdict | task | glob, or tuple up with regex string
+    add_inputs could be task
+
+    out could be
+        fmt string | string
+
+    astromatic tools
+        in_ each in should have an inkey
+        out each out should have an outkey
+        dump configuration is automatically generated as an additional step
