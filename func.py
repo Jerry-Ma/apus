@@ -34,6 +34,8 @@ def create_symbolic_link(in_file, out_file, **kwargs):
     :out_file: filename of symlink to create
 
     """
+    print in_file
+    print out_file
     log = get_log_func(**kwargs)
     in_file = os.path.abspath(in_file)
     out_file = os.path.abspath(out_file)

@@ -974,7 +974,9 @@ def callable_task(in_files, out_files, context):
         # with logger_mutex:
         #     logger.debug('run: {0}'.format(mesg))
         kwargs = {'task': task, 'logger': logger, 'logger_mutex': logger_mutex}
-        output = func(in_files, out_files, **kwargs)
+        output = func(unwrap_if_len_one(in_files),
+                      unwrap_if_len_one(out_files),
+                      **kwargs)
     if not output and task.get('allow_finish_silently', False):
         pass
     else:
