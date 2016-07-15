@@ -25,10 +25,10 @@ from datetime import timedelta
 import ruffus
 import ruffus.cmdline as cmdline
 from ruffus.proxy_logger import make_shared_logger_and_proxy
-from ruffus import mkdir
+# from ruffus import mkdir
 from ruffus import Pipeline
 from ruffus import formatter
-from ruffus import inputs
+# from ruffus import add_inputs
 from ruffus import output_from
 from ruffus.ruffus_exceptions import error_ambiguous_task
 import env
@@ -48,7 +48,8 @@ def ensure_list(value, tuple_as_list=False):
     elif value is None:
         value = []
     elif isinstance(value, listclass):
-        pass
+        if isinstance(value, tuple):
+            value = list(value)
     else:
         raise RuntimeError("not able to ensure list type for {0}"
                            .format(value))
@@ -178,14 +179,14 @@ def get_task_func(func):
         raise RuntimeError(errmsg)
 
 
-def aggregate_task_inputs(input_, validate_tuple_num_elem=2):
+def aggregate_task_inputs(input_, tuple_num_elem=2):
     formatter_inputs = []
     simple_inputs = []
     generator_inputs = []
     for in_ in input_:
         if callable(in_):
             generator_inputs.append(in_)
-        elif isinstance(in_, tuple) and len(in_) == validate_tuple_num_elem:
+        elif isinstance(in_, tuple) and len(in_) == tuple_num_elem:
             if callable(in_[0]):
                 raise RuntimeError('generator input should not have formatter'
                                    ' {0}'.format(in_))
@@ -271,8 +272,10 @@ def create_ruffus_task(pipe, config, task, **kwargs):
             elif not os.path.isabs(i):  # prepend default io dir
                 i = os.path.join(config.task_io_default_dir, i)
                 temp_reg = r'(?:[^/]*/)*' + reg
+            else:
+                pass
             if re.search(r'[?*,\[\]{}]', i) is not None:
-                # slice on flagged task
+                # slice on flagged task with glob input
                 if config.slice_test is not None \
                         and task.get('allow_slice', False):
                     config.logger.info(
@@ -311,7 +314,7 @@ def create_ruffus_task(pipe, config, task, **kwargs):
                 in_ = os.path.join(config.task_io_default_dir, in_)
             task_inkey.append(in_)
         if len(task_inkey) > 0:
-            task_kwargs[inkey] = inputs(task_inkey)  # ruffus req.
+            task_kwargs[inkey] = tuple(task_inkey)  # ruffus req.
     # handle outputs
     task_output = []
     for out in ensure_list(task.get('out', None)):
@@ -324,6 +327,12 @@ def create_ruffus_task(pipe, config, task, **kwargs):
         task_kwargs['output'] = os.path.join(
             config.task_io_default_dir,
             task_name.replace(' ', '_') + '.success')
+    # handle follows
+    task_follows = [t['name'] if isinstance(t, dict) else t
+                    for t in ensure_list(task.get('follows', []))]
+    if 'follows' in context.keys():
+        # for cleaner debug info
+        context['follows'] = unwrap_if_len_one(task_follows)
     # handle context as extra
     task_extras = []
     for extra in ensure_list(task.get('extras', None)):
@@ -340,12 +349,9 @@ def create_ruffus_task(pipe, config, task, **kwargs):
     task_kwargs['extras'] = task_extras
     # create ruffus task
     ruffus_task = pipe_func(*task_args, **task_kwargs)
-    # handle follows
-    task_follows = [t['name'] if isinstance(t, dict) else t
-                    for t in ensure_list(task.get('follows', []))]
     # additional follows for astromatic task if no input config is supplied
     if task_func.__name__ == 'astromatic_task' and \
-            'conf_file' not in ensure_list(task.get('in_keys', None)):
+            'conf' not in ensure_list(task.get('in_keys', None)):
         pre_task = {
                 'name': 'config {0}'.format(task_name),
                 'func': func.dump_config_files,
@@ -376,7 +382,7 @@ def build_init_pipeline(config, option):
 
     # rectify the inputs
     formatter_inputs, simple_inputs, _ = aggregate_task_inputs(
-            ensure_list(config.inputs), validate_tuple_num_elem=3)
+            ensure_list(config.inputs), tuple_num_elem=3)
     if len(formatter_inputs) + len(simple_inputs) == 0:
         raise RuntimeError('no input specified')
     # create tasks
@@ -443,6 +449,8 @@ def bootstrap():
     """
     print("+- APUS powered by Ruffus ver {0} -+".format(ruffus.__version__))
     config, option = configure(sys.modules['__main__'], sys.argv[1:])
+    # set up env with overrides
+    env.am.set_overrides(config.env_overrides)
     # check existence of the jobdir
     if option.action == 'run':
         if not os.path.exists(config.jobdir):
@@ -461,303 +469,6 @@ def bootstrap():
         for t in option.forced_tasks:
             config.logger.info("forced redo: {0}".format(utils.alert(t)))
     # mark the begin time
-    config.timestamp = time.time()
-    cmdline.run(option, checksum_level=1)
-
-
-def get_amprog(string):
-    """naming convention of the astromatic task key: sex_suffix"""
-    prog = string.split('_', 1)[0]
-    return prog
-
-
-def get_amsuffix(string):
-    """naming convention of the astromatic task key: sex_suffix"""
-    if '_' in string:
-        return string.split('_', 1)[-1]
-    else:
-        return ""
-
-
-def get_amconf(key):
-    """naming convention of astromatic configuration file"""
-    return 'conf.{0}'.format(key)
-
-
-def am_config_default(prog):
-    if prog == 'sex':
-        return {'STARNNW_NAME': 'default.nnw',
-                'WRITE_XML': 'N',
-                'BACKPHOTO_TYPE': 'LOCAL',
-                'PIXEL_SCALE': '0',
-                'HEADER_SUFFIX': '.none'}
-    elif prog == 'scamp':
-        return {'CHECKPLOT_RES': '1024',
-                'SAVE_REFCATALOG': 'Y',
-                'WRITE_XML': 'Y',
-                }
-    elif prog == 'swarp':
-        return {'INTERPOLATE': 'N',
-                'FSCALASTRO_TYPE': 'VARIABLE',
-                'DELETE_TMPFILES': 'N',
-                'NOPENFILES_MAX': '1000000',
-                }
-
-
-def dump_configuration_files(flag_file, config):
-    """Dump AstrOmatic configuration files
-
-    :config: config object
-    """
-
-    logger, logger_mutex = config.logger, config.logger_mutex
-    confdir = config.confdir
-    am_diagdir = config.am_diagdir
-    am_sharedir = config.am_sharedir
-    am_resampdir = config.am_resampdir
-    am_params = config.am_params
-    # aggregate keys by program: sex -> sex_1, sex_2 ...
-    # merge param to per_task_params
-    global_params = {}
-    per_task_params = {}
-    has_per_task_params = dict(sex=0, scamp=0, swarp=0)
-    for key in am_params.keys():
-        program = get_amprog(key)
-        if '_' in key:
-            per_task_params[key] = am_params[key]
-            _d = am_config_default(program)
-            _d.update(**am_params.get(program, {}))
-            _d.update(**per_task_params[key])
-            per_task_params[key] = _d
-            has_per_task_params[program] += 1
-        else:
-            global_params[key] = dict(am_config_default(program),
-                                      **am_params[key])
-    for k, v in has_per_task_params.items():
-        if v == 0 and k in global_params.keys():
-            per_task_params[k] = global_params[k]
-
-    # create configuration files and set up the path
-    for key, param in per_task_params.items():
-        program = get_amprog(key)  # e.g. sex for sex_astro
-        am_bin = env.am.get('{0}bin'.format(program), None)
-        if am_bin is None:
-            raise ValueError('path to executable for {0} is not defined'
-                             .format(program))
-        # default am_share directory
-        if config.am_sharedir is None:
-            am_sharedir = env.am.get('{0}share'.format(program))
-        # generate filenames
-        conffile = get_amconf(key)
-        if program == 'sex':  # both conf and param
-            paramfile = conffile + '.param'
-            param['PARAMETERS_NAME'] = os.path.join(confdir, paramfile)
-        if program == 'scamp':
-            amsuffix = get_amsuffix(key)
-            param['CHECKPLOT_NAME'] =\
-                utils.get_scamp_checkplot_name(os.path.abspath(am_diagdir),
-                                               prefix=amsuffix)
-        elif program == 'swarp' and \
-                param.get('RESAMPLE_DIR', None) is None:
-            param['RESAMPLE_DIR'] = am_resampdir
-        # use absolute dir whenever possible
-        for k, v in param.items():
-            if os.path.isfile(v):
-                param[k] = os.path.abspath(v)
-            elif os.path.isfile(os.path.join(am_sharedir, v)):
-                param[k] = os.path.abspath(os.path.join(am_sharedir, v))
-            elif os.path.isfile(os.path.join(confdir, v)):
-                param[k] = os.path.abspath(os.path.join(confdir, v))
-            else:
-                param[k] = v
-        # create config and param
-        conffile = os.path.join(confdir, conffile)
-        fo = StringIO.StringIO(subprocess.check_output([am_bin, '-dd']))
-        utils.dump_astromatic_conf(fo, conffile, clobber=True, **param)
-        with logger_mutex:
-            logger.info('dump conf: {0}'.format(conffile))
-            for k, v in param.items():
-                logger.info('{0:>20s}: {1:s}'.format(k, v))
-        fo.close()
-        if program == 'sex':
-            paramfile = os.path.join(confdir, paramfile)
-            fo = StringIO.StringIO(subprocess.check_output([am_bin, '-dp']))
-            utils.dump_sex_param(fo, paramfile, clobber=True)
-            with logger_mutex:
-                logger.info('dump param: {0}'.format(paramfile))
-            fo.close()
-    # write flag file
-    with open(flag_file, 'w'):
-        pass
-
-
-# since config is a module and non-picklable, we need to get the relevant
-# configurations to an new object before pass to pipeline
-class _Conf(object):
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-def create_symlink():
-    pass
-
-
-def init(config, option):
-    """prepare directories and files for the job
-
-    :config: configuration module
-    :option: commandline argument
-    :returns: pipeline object
-    """
-
-    confdirs = ['confdir', 'am_diagdir', 'am_sharedir', 'am_resampdir']
-    _conf = _Conf(
-            **{k: getattr(config, k) for k in
-               ['logger', 'logger_mutex', 'jobdir', 'am_params'] + confdirs
-               })
-
-    pipe = Pipeline(name=config.jobkey + '.init')
-    t01 = pipe.transform(
-        create_symlink,
-        name='link files to work directory',
-        input=config.inputs,
-        filter=formatter(config.input_reg),
-        output=config.input_fmt,
-        extras=[config.per_input_extra, config.logger, config.logger_mutex])
-    t01.follows(mkdir(config.jobdir)).jobs_limit(1),
-    t02 = pipe.originate(
-            dump_configuration_files,
-            [os.path.join(config.jobdir, 'dump_conf.success'), ],
-            extras=[_conf, ],
-            name='dump configuration files',
-            )
-    t02.follows(t01, *[mkdir(getattr(_conf, _dir)) for _dir in confdirs
-                       if getattr(_conf, _dir) is not None])
-    if config.extra is not None:
-        t03 = pipe.transform(
-                create_symlink,
-                name='link ancillary files',
-                input=config.extra,
-                filter=formatter(config.extra_reg),
-                output=config.extra_fmt,
-                extras=[None, config.logger, config.logger_mutex])
-        t03.follows(t02)
-    return pipe
-
-
-def build(config, option):
-    """assemble the pipeline
-
-    :config: configuration module
-    :option: commandline argument
-    :returns: pipeline object
-    """
-    pipe = Pipeline(name=config.jobkey)
-    for task in config.tlist:
-        create_ruffus_task(pipe, config, task)
-    return pipe
-
-
-def configure_(config, args):
-    """parse commandline arguments, split the ruffus arguments from
-    configuration items, also provide some shortcuts
-
-    :config: configuration module
-    :args: arguments supplied in commandline
-    :returns: rectified configuration module, argparse option object
-
-    """
-    # handle optional attributes, always use absolute path
-    config.per_input_extra = getattr(config, 'per_input_extra', None)
-    config.extra = getattr(config, 'extra', None)
-    config.confdir = os.path.abspath(
-            getattr(config, 'confdir', config.jobdir))
-    config.am_diagdir = os.path.abspath(
-            getattr(config, 'am_diagdir', config.jobdir))
-    # default to the am_share, will be set in the dump configuration step
-    config.am_sharedir = getattr(config, 'am_sharedir', None)
-    config.am_resampdir = os.path.abspath(
-            getattr(config, 'am_resampdir', env.scratch))
-    config.am_params = getattr(config, 'am_params', {})
-    config.log_file = getattr(config, 'log_file',
-                              '{0}.log'.format(config.jobkey))
-    config.history_file = getattr(config, 'history_file',
-                                  '{0}.ruffus'.format(config.jobkey))
-
-    # ruffus options, some will be synchronized to config:
-    # log_file, ...
-    parser = cmdline.get_argparse(description="""
-+- Astronomy Pipeline Using ruffuS (script by Zhiyuan Ma) -+
-""", version=ruffus.__version__)
-    # additional options
-    parser.add_argument('action', nargs='?', default='run',
-                        choices=['init', 'run'],
-                        help='the action to take: init the job directory,'
-                        ' or run the analysis')
-    parser.add_argument(
-            '-r', '--redo-all', action='store_true',
-            help='force redo all tasks')
-    parser.add_argument(
-            '-d', '--dry-run', action='store_true',
-            help='perform dry run for debugging purpose')
-    # logger: default to config.log_file if not supplied in commandline
-    parser.set_defaults(
-            verbose=['0', ],
-            log_file=config.log_file,
-            history_file=config.history_file
-            )
-    option = parser.parse_args(args)
-    # handle logging
-    logger, logger_mutex = make_shared_logger_and_proxy(
-            logger_factory, str(config.jobkey),
-            [option.log_file, option.verbose])
-    config.logger = logger
-    config.logger_mutex = logger_mutex
-
-    # handle dryrun
-    config.dryrun = option.dry_run
-
-    # expand glob for config.input
-    inputs = []  # expand glob patterns
-    for glob_pattern in config.inputs:
-        inputs.extend(glob.glob(glob_pattern))
-    if not inputs:
-        raise RuntimeError('no input files could be found, exit')
-    else:
-        logger.info('input files (total {0}):'.format(len(inputs)))
-        for input_ in inputs:
-            logger.info('{0}'.format(input_))
-        config.inputs = list(set(map(os.path.abspath, inputs)))
-
-    return config, option
-
-
-def bootstrap_():
-    """parse commandline argument, create pipeline object, and run the job
-
-    """
-    print("+- APUS powered by Ruffus ver {0} -+".format(ruffus.__version__))
-    config, option = configure(sys.modules['__main__'], sys.argv[1:])
-    # check existence of the jobdir
-    if option.action == 'run':
-        if not os.path.exists(config.jobdir):
-            raise RuntimeError('job directory does not exist,'
-                               ' run init to create one')
-        else:
-            build(config, option)
-    elif option.action == 'init':
-        option.history_file = option.history_file + '.init'
-        init(config, option)
-
-    # handle redo-all
-    if option.redo_all:
-        task_list = ruffus.pipeline_get_task_names()
-        option.forced_tasks.extend(task_list)
-    if len(option.forced_tasks) > 0:
-        config.logger.info("forced redo:")
-        for t in option.forced_tasks:
-            config.logger.info("{0}".format(t))
-    # add timestamp
     config.timestamp = time.time()
     cmdline.run(option, checksum_level=1)
 
@@ -839,8 +550,8 @@ def task_finish_signal(task_name, config):
 @ensure_args_as_list(0)
 def touch_file(out_files):
     for out in out_files:
-        with open(out, 'w'):
-            pass
+        with open(out, 'a'):
+            os.utime(out, None)
 
 
 @ensure_args_as_list(0)
@@ -870,8 +581,8 @@ def documented_subprocess_call(command, flag=None):
             with open(flag, 'w'):
                 pass
         return output
-    print(command)
-    func.__doc__ = ' '.join(command)
+    # print(' '.join(command))
+    func.__doc__ = 'subprocess: ' + ' '.join(command)
     return func
 
 
@@ -885,40 +596,83 @@ def astromatic_task(in_files, out_files, *extras):
     return callable_task(in_files, out_files, dict(context, task=task))
 
 
+def get_astromatic_inputs(inputs, in_keys):
+    """identify the inputs by mapping to the in_keys"""
+
+    # collate, no add_input: [(in1, in2, ...), ex1, ex2]
+    # key: [key1, ekey1, ekey2]
+
+    # collate, add_input: [((in1, add1, add2), (in2, add1, add2)), ex1, ex2]
+    # key: [(key1, key2 key3), ekey1, ekey2]
+
+    # transform, no add_input: [ in, ex1, ex2]
+    # key: [key1, ekey1, ekey2]
+
+    # transform, add_input: [(in, add1), ex1, ex2]
+    # key: [(key1, key2 key3), ekey1, ekey2]
+
+    # ret:
+    #   [(key1, [in1, in2, .. ]), (key2, [add1_1, add1_2 ..])
+    ret_keys = []
+    ret_vals = []
+    # first level zip for exkeys
+    for key, val in zip(in_keys, inputs):
+        if isinstance(key, tuple):  # deal with tuple keys:
+            if all(isinstance(v, tuple) for v in val):
+                val = zip(*val)  # tuple of tuple, need to be zipped
+            if len(key) == len(val):
+                ret_keys.extend(key)
+                ret_vals.extend(val)
+            else:
+                raise RuntimeError(
+                    "mismatched number of"
+                    " keys ({0}) and inputs {1}".format(len(key), len(val)))
+        else:
+            ret_keys.append(key)
+            ret_vals.append(val)
+    # aggregate duplicated keys
+    ag_keys = list(set(ret_keys))
+    ag_vals = [[] for _ in range(len(ag_keys))]
+    for i, key in enumerate(ret_keys):
+        ag_vals[ag_keys.index(key)].append(ret_vals[i])
+    for i, val in enumerate(ag_vals):
+        # validate list-type keys
+        if any([isinstance(v, tuple) for v in val]):
+            if len(val) > 1:
+                raise RuntimeError("list-type key {0} should only appear once"
+                                   " in in_keys".format(ag_keys[i]))
+            else:
+                ag_vals[i] = val[0]
+    return zip(ag_keys, ag_vals)
+
+
 def get_astromatic_callable(in_files, out_files, context):
     """return the command for executing astromatic task"""
-    out_files, flag = get_flagfile(out_files)
     task = context['task']
+    # ensure there is a flag file at least for check pointing
+    out_files, flag = get_flagfile(out_files)
     # get program
     program = [i for i in ['sex', 'scamp', 'swarp']
                if task['func'].lower().startswith(i)][0]
     # split up inputs types
-    inputs = []
-    conf_file = []
-    conf_overrides = []
-    keyword_overrides = []
-    for key, val in zip(task.get('in_keys', ['in', ]), in_files):
-        val = ensure_list(val)
+    rectified_inputs = get_astromatic_inputs(in_files,
+                                             task.get('in_keys', ['in', ]))
+    command = [env.am.get('{0}bin'.format(program)), ]
+    params = {}
+    for key, val in rectified_inputs:
+        # here val is a list of values
         if key == 'in':
-            inputs.extend(val)
-        elif key == 'conf_file':
-            conf_file.extend(val)
-        elif key == 'conf_overrides':
-            conf_overrides.extend(val)
-        else:
-            keyword_overrides.append('-{0} {1}'.format(key, ', '.join(val)))
-    # build command
-    if len(conf_file) != 1:
-        raise RuntimeError('no configuration file specified for {0}'
-                           .format(task['func']))
-    # FIXME need better handle inputs
-    inputs = unwrap_if_len_one(inputs)
-    if isinstance(inputs, tuple):
-        inputs = list(inputs)
-    command = [env.am['{0}bin'.format(program)], '-c', conf_file[0]] + inputs
-    # handle param overrides
-    params = utils.parse_astromatic_conf(*conf_overrides)
-    params.update(dict(keyword_overrides))
+            command.extend(val)
+        elif key == 'conf':
+            if len(val) < 1:
+                raise RuntimeError('no configuration file specified for {0}'
+                                   .format(task['func']))
+            else:
+                command.extend(['-c', val[0]])
+                params.update(utils.parse_astromatic_conf(*val[1:]))
+        else:  # values should be concat by comma
+            params[key] = ','.join(val)
+    params.update(task.get('params', {}))
     for key, val in params.items():
         command.extend(['-{0}'.format(key), '"{0}"'.format(val)])
     # handle outkeys
@@ -930,7 +684,6 @@ def get_astromatic_callable(in_files, out_files, context):
     out_keys = task.get('out_keys', default_outkeys[program])
     for i, key in enumerate(out_keys):
         command.extend(['-{0}'.format(key), out_files[i]])
-
     # handle out_files
     # if program == 'sex':
     #     outkey = ensure_list(task.get('outkey', 'CATALOG_NAME'))
@@ -1016,16 +769,17 @@ def callable_task(in_files, out_files, *extras):
     task, logger, logger_mutex = [
             context[i] for i in ['task', 'logger', 'logger_mutex']]
     func = task['func']
-    mesg = "{0}({1}, {2})".format(func.__name__, in_files, out_files)
-    if func.__doc__:
-        mesg += ': {0}'.format(func.__doc__.split('\n')[0])
+    if func.__doc__.startswith('subprocess: '):
+        mesg = '{0}'.format(func.__doc__.lstrip('subprocess: '))
+    else:
+        mesg = "{0}({1}, {2})".format(func.__name__, in_files, out_files)
     if task.get('dry_run', False):
         output = '~dry~run~3~sec: {0}'.format(mesg)
         time.sleep(1)
-        # touch_file(out_files)
+        touch_file(out_files)
     else:
-        # with logger_mutex:
-        #     logger.debug('run: {0}'.format(mesg))
+        with logger_mutex:
+            logger.debug('{0}'.format(mesg))
         kwargs = {'task': task, 'logger': logger, 'logger_mutex': logger_mutex}
         output = func(unwrap_if_len_one(in_files),
                       unwrap_if_len_one(out_files),
@@ -1038,84 +792,128 @@ def callable_task(in_files, out_files, *extras):
             logger.debug(output)
 
 
-def parse_task_func(func):
-    errmsg = 'not a meaningful tfunc: {0}'.format(func)
-    if isinstance(func, str):
-        program = get_amprog(func)
-        if program in ['sex', 'scamp', 'swarp']:
-            return astromatic_task, get_amconf(func)
-        else:
-            command = func.split()
-            if '{in}' in command or '{out}' in command:
-                return subprocess_task, None
-            else:
-                raise RuntimeError(errmsg)
-    elif callable(func):
-        return callable_task, None
+# OBSOLETE
+def get_amprog(string):
+    """naming convention of the astromatic task key: sex_suffix"""
+    prog = string.split('_', 1)[0]
+    return prog
+
+
+def get_amsuffix(string):
+    """naming convention of the astromatic task key: sex_suffix"""
+    if '_' in string:
+        return string.split('_', 1)[-1]
     else:
-        raise RuntimeError(errmsg)
+        return ""
 
 
-def is_task_name():
-    pass
+def get_amconf(key):
+    """naming convention of astromatic configuration file"""
+    return 'conf.{0}'.format(key)
 
 
-def create_ruffus_task_(pipe, config, task):
-    """create Ruffus task from the task dictionary and add to pipe"""
-    task_name = task['name']
+def am_config_default(prog):
+    if prog == 'sex':
+        return {'STARNNW_NAME': 'default.nnw',
+                'WRITE_XML': 'N',
+                'BACKPHOTO_TYPE': 'LOCAL',
+                'PIXEL_SCALE': '0',
+                'HEADER_SUFFIX': '.none'}
+    elif prog == 'scamp':
+        return {'CHECKPLOT_RES': '1024',
+                'SAVE_REFCATALOG': 'Y',
+                'WRITE_XML': 'Y',
+                }
+    elif prog == 'swarp':
+        return {'INTERPOLATE': 'N',
+                'FSCALASTRO_TYPE': 'VARIABLE',
+                'DELETE_TMPFILES': 'N',
+                'NOPENFILES_MAX': '1000000',
+                }
 
-    # handle task function
-    task_func, conffile = parse_task_func(task['func'])
-    if conffile is not None:
-        task['conffile'] = os.path.join(config.confdir, conffile)
 
-    # handle dryrun
-    if config.dry_run:
-        task['dry_run'] = task.get('dry_run', True)
+def dump_configuration_files(flag_file, config):
+    """Dump AstrOmatic configuration files
 
-    pipe_func = getattr(pipe, task['type_'])
-    task_args = []
-    task_kwargs = {
-            'name': task_name,
-            'extras': [task, config.logger, config.logger_mutex],
-            }
-    # handle input
-    _input = [output_from(i) if is_task_name(i) else i
-              for i in ensure_list(task['in_'])]
-    if len(_input) == 1:
-        # handle @file, where geneartor should be unnamed arg
-        if callable(_input[0]):
-            task_args.append(_input[0])
+    :config: config object
+    """
+
+    logger, logger_mutex = config.logger, config.logger_mutex
+    confdir = config.confdir
+    am_diagdir = config.am_diagdir
+    am_sharedir = config.am_sharedir
+    am_resampdir = config.am_resampdir
+    am_params = config.am_params
+    # aggregate keys by program: sex -> sex_1, sex_2 ...
+    # merge param to per_task_params
+    global_params = {}
+    per_task_params = {}
+    has_per_task_params = dict(sex=0, scamp=0, swarp=0)
+    for key in am_params.keys():
+        program = get_amprog(key)
+        if '_' in key:
+            per_task_params[key] = am_params[key]
+            _d = am_config_default(program)
+            _d.update(**am_params.get(program, {}))
+            _d.update(**per_task_params[key])
+            per_task_params[key] = _d
+            has_per_task_params[program] += 1
         else:
-            task_kwargs['input'] = _input[0]
-    elif len(_input) > 1:
-        task_kwargs['input'] = _input
-    # handle filter
-    _reg = ensure_list(task.get('reg', None))
-    if len(_reg) > 0:
-        task_kwargs['filter'] = formatter(*_reg)
-    # handle additional inputs
-    for _inkey in ['add_inputs', 'replace_inputs']:
-        _add_inputs = ensure_list(task.get(_inkey, None))
-        if len(_add_inputs) > 0:
-            # replace task name with task
-            _real_add_inputs = []
-            for i in _add_inputs:
-                try:
-                    _tt, = pipe.lookup_task_from_name(i, "__main__")
-                    _real_add_inputs.append(_tt)
-                except (ValueError, error_ambiguous_task):
-                    _real_add_inputs.append(i)
-            task_kwargs[_inkey] = tuple(_real_add_inputs)  # ruffus req.
-    # handle outputs
-    if task.get('out', None) is not None:
-        task_kwargs['output'] = task['out']
-    else:  # flag file for checkpointing
-        task_kwargs['output'] = os.path.join(
-                config.jobdir, task_name.replace(' ', '_') + '.success')
-    tt = pipe_func(task_func, *task_args, **task_kwargs)
-    # handle follows
-    if task.get('follows', None) is not None:
-        tt.follows(*ensure_list(task['follows']))
-    tt.posttask(task_finish_signal(task_name, config))
-    return tt
+            global_params[key] = dict(am_config_default(program),
+                                      **am_params[key])
+    for k, v in has_per_task_params.items():
+        if v == 0 and k in global_params.keys():
+            per_task_params[k] = global_params[k]
+
+    # create configuration files and set up the path
+    for key, param in per_task_params.items():
+        program = get_amprog(key)  # e.g. sex for sex_astro
+        am_bin = config.get('{0}bin'.format(program), None)
+        if am_bin is None:
+            raise ValueError('path to executable for {0} is not defined'
+                             .format(program))
+        # default am_share directory
+        if config.am_sharedir is None:
+            am_sharedir = env.am.get('{0}share'.format(program))
+        # generate filenames
+        conffile = get_amconf(key)
+        if program == 'sex':  # both conf and param
+            paramfile = conffile + '.param'
+            param['PARAMETERS_NAME'] = os.path.join(confdir, paramfile)
+        if program == 'scamp':
+            amsuffix = get_amsuffix(key)
+            param['CHECKPLOT_NAME'] =\
+                utils.get_scamp_checkplot_name(os.path.abspath(am_diagdir),
+                                               prefix=amsuffix)
+        elif program == 'swarp' and \
+                param.get('RESAMPLE_DIR', None) is None:
+            param['RESAMPLE_DIR'] = am_resampdir
+        # use absolute dir whenever possible
+        for k, v in param.items():
+            if os.path.isfile(v):
+                param[k] = os.path.abspath(v)
+            elif os.path.isfile(os.path.join(am_sharedir, v)):
+                param[k] = os.path.abspath(os.path.join(am_sharedir, v))
+            elif os.path.isfile(os.path.join(confdir, v)):
+                param[k] = os.path.abspath(os.path.join(confdir, v))
+            else:
+                param[k] = v
+        # create config and param
+        conffile = os.path.join(confdir, conffile)
+        fo = StringIO.StringIO(subprocess.check_output([am_bin, '-dd']))
+        utils.dump_astromatic_conf(fo, conffile, clobber=True, **param)
+        with logger_mutex:
+            logger.info('dump conf: {0}'.format(conffile))
+            for k, v in param.items():
+                logger.info('{0:>20s}: {1:s}'.format(k, v))
+        fo.close()
+        if program == 'sex':
+            paramfile = os.path.join(confdir, paramfile)
+            fo = StringIO.StringIO(subprocess.check_output([am_bin, '-dp']))
+            utils.dump_sex_param(fo, paramfile, clobber=True)
+            with logger_mutex:
+                logger.info('dump param: {0}'.format(paramfile))
+            fo.close()
+    # write flag file
+    with open(flag_file, 'w'):
+        pass

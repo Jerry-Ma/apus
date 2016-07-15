@@ -13,16 +13,69 @@ Paths to the astromatic executables and related directories
 import os
 
 
-scratch = '/mnt/Scratch/swarp_resamp'
+class AmConfig(object):
 
-# astromatic
-am = {
-    'root': '/home/ma/Codes/astromatic',
-    }
-am['share'] = os.path.join(am['root'], 'share')
-am['sexbin'] = os.path.join(am['root'], 'bin/sex')
-am['scampbin'] = os.path.join(am['root'], 'bin/scamp')
-am['swarpbin'] = os.path.join(am['root'], 'bin/swarp')
-am['sexshare'] = os.path.join(am['share'], 'sextractor')
-am['scampshare'] = os.path.join(am['share'], 'scamp')
-am['swarpshare'] = os.path.join(am['share'], 'swarp')
+    sexparam_default = [
+        # coord
+        'ALPHA_J2000', 'DELTA_J2000', 'X_IMAGE', 'Y_IMAGE',
+        'NUMBER', 'EXT_NUMBER',
+        # phot
+        'MAG_AUTO', 'MAGERR_AUTO', 'MAG_APER', 'MAGERR_APER',
+        'FLUX_AUTO', 'FLUXERR_AUTO', 'FLUX_APER', 'FLUXERR_APER',
+        'BACKGROUND', 'THRESHOLD',
+        # scamp
+        'XWIN_IMAGE', 'YWIN_IMAGE',
+        'ERRAWIN_IMAGE', 'ERRBWIN_IMAGE', 'ERRTHETAWIN_IMAGE',
+        'FLAGS', 'FLAGS_WEIGHT', 'FLAGS_WIN', 'IMAFLAGS_ISO',
+        'FLUX_RADIUS',
+        # ref key
+        'X_WORLD', 'Y_WORLD',
+        'ERRA_WORLD', 'ERRB_WORLD', 'ERRTHETA_WORLD',
+        # PSF shape
+        'FWHM_IMAGE', 'A_IMAGE', 'B_IMAGE', 'ELLIPTICITY',
+        'CLASS_STAR'
+        ]
+    sex_default = {
+            'STARNNW_NAME': 'default.nnw',
+            'WRITE_XML': 'N',
+            'BACKPHOTO_TYPE': 'LOCAL',
+            'PIXEL_SCALE': '0',
+            'HEADER_SUFFIX': '.none',
+            'GAIN_KEY': 'bug_of_sex_219',
+            }
+    scamp_default = {
+            'CHECKPLOT_RES': '1024',
+            'SAVE_REFCATALOG': 'Y',
+            'WRITE_XML': 'Y',
+            }
+    swarp_default = {
+            'INTERPOLATE': 'N',
+            'FSCALASTRO_TYPE': 'VARIABLE',
+            'DELETE_TMPFILES': 'N',
+            'NOPENFILES_MAX': '1000000',
+            }
+    scratch_dir = '/mnt/Scratch/swarp_resamp'
+    path_prefix = '/usr'
+
+    def __init__(self, **kwargs):
+        """populate properties, with optional overrides from kwargs"""
+        self.set_overrides(kwargs)
+
+    def get(self, prop):
+        return self.overrides.get(prop, getattr(self, prop))
+
+    def set_overrides(self, overrides):
+        self.overrides = overrides
+        self.share_dir = os.path.join(self.get('path_prefix'), 'share')
+        self.bin_dir = os.path.join(self.get('path_prefix'), 'bin')
+        for sname, lname in [('sex', 'sextractor'),
+                             ('scamp', 'scamp'),
+                             ('swarp', 'swarp')]:
+            for i in ['bin', 'share']:
+                if sname == 'sex' and i == 'bin':
+                    lname = 'sex'  # sextractor binary naming
+                setattr(self, '{0}{1}'.format(sname, i),
+                        os.path.join(self.get('{0}_dir'.format(i)), lname))
+
+
+am = AmConfig()

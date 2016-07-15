@@ -41,3 +41,8 @@
         in_ each in should have an inkey
         out each out should have an outkey
         dump configuration is automatically generated as an additional step
+
+# NOTEs about in_, and transform/collate
+    transform should aways be one-to-one:
+        in_: single: single transformed
+             multiple: merged as one flat list
