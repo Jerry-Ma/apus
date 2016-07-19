@@ -364,6 +364,10 @@ def create_ruffus_task(pipe, config, task, **kwargs):
             pipe, config, pre_task, task_io_default_dir=''))
     if len(task_follows) > 0:
         ruffus_task.follows(*task_follows)
+    # handle job_limit
+    jobs_limit = task.get('jobs_limit', None)
+    if jobs_limit is not None:
+        ruffus_task.jobs_limit(jobs_limit)
     # add finish signal
     ruffus_task.posttask(task_finish_signal(task_name, config))
     return ruffus_task
@@ -787,7 +791,7 @@ def callable_task(in_files, out_files, *extras):
     if not output and task.get('allow_finish_silently', False):
         pass
     else:
-        output = "finished silently"
+        output = "finished silently" if not output else output
         with logger_mutex:
             logger.debug(output)
 
