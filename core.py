@@ -569,7 +569,7 @@ def get_flagfile(out_files):
 
 
 def documented_subprocess_call(command, flag=None):
-    def func(*args, **kwargs):
+    def call(*args, **kwargs):
         # handle scamp refcatalog suffix
         if '-ASTREFCAT_NAME' in command:
             ikey = command.index('-ASTREFCAT_NAME') + 1
@@ -580,14 +580,28 @@ def documented_subprocess_call(command, flag=None):
                 refcatfiles = glob.glob(refcatkey)
             if len(refcatfiles) > 0:
                 command[ikey] = ','.join(refcatfiles)
-        output = subprocess.check_output(command)
+        log = func.get_log_func(**kwargs)
+        # output = subprocess.check_output(command)
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, bufsize=1)
+        has_output = False
+        for ln in iter(proc.stdout.readline, b''):
+            if ln:
+                has_output = True
+            log('debug', ln.strip('\n'))
+        if proc.poll() is not None and proc.returncode != 0:
+            # an error happened!
+            err_msg = "%s\nsubprocess failed with code: %s" % (
+                    proc.stderr.read(), proc.returncode)
+            raise RuntimeError(err_msg)
         if flag is not None:
             with open(flag, 'w'):
                 pass
-        return output
+        return has_output
+        # return output
     # print(' '.join(command))
-    func.__doc__ = 'subprocess: ' + ' '.join(command)
-    return func
+    call.__doc__ = 'subprocess: ' + ' '.join(command)
+    return call
 
 
 @ensure_args_as_list(0, 1)
@@ -756,6 +770,11 @@ def subprocess_task(in_files, out_files, *extras):
 
 
 def get_subprocess_callable(in_files, out_files, context):
+    if any(isinstance(i, tuple) for i in in_files):
+        if len(in_files) > 1:
+            raise RuntimeError("subprocess task should not have nested inputs")
+        else:
+            in_files = in_files[0]
     out_files, flag = get_flagfile(out_files)
     command = context['task']['func'].split()
     for key, value in zip(['{in}', '{out}'], [in_files, out_files]):
@@ -774,7 +793,7 @@ def callable_task(in_files, out_files, *extras):
             context[i] for i in ['task', 'logger', 'logger_mutex']]
     func = task['func']
     if func.__doc__.startswith('subprocess: '):
-        mesg = '{0}'.format(func.__doc__.lstrip('subprocess: '))
+        mesg = func.__doc__[len('subprocess: '):]
     else:
         mesg = "{0}({1}, {2})".format(func.__name__, in_files, out_files)
     if task.get('dry_run', False):
@@ -783,7 +802,7 @@ def callable_task(in_files, out_files, *extras):
         touch_file(out_files)
     else:
         with logger_mutex:
-            logger.debug('{0}'.format(mesg))
+            logger.debug(mesg)
         kwargs = {'task': task, 'logger': logger, 'logger_mutex': logger_mutex}
         output = func(unwrap_if_len_one(in_files),
                       unwrap_if_len_one(out_files),
@@ -791,7 +810,7 @@ def callable_task(in_files, out_files, *extras):
     if not output and task.get('allow_finish_silently', False):
         pass
     else:
-        output = "finished silently" if not output else output
+        output = "finished silently" if not output else "finished"
         with logger_mutex:
             logger.debug(output)
 
