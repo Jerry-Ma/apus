@@ -26,22 +26,26 @@ class AmConfig(object):
         # scamp
         'XWIN_IMAGE', 'YWIN_IMAGE',
         'ERRAWIN_IMAGE', 'ERRBWIN_IMAGE', 'ERRTHETAWIN_IMAGE',
-        'FLAGS', 'FLAGS_WEIGHT', 'FLAGS_WIN', 'IMAFLAGS_ISO',
+        'FLAGS', 'FLAGS_WEIGHT', 'FLAGS_WIN',  # 'IMAFLAGS_ISO',
         'FLUX_RADIUS',
         # ref key
         'X_WORLD', 'Y_WORLD',
         'ERRA_WORLD', 'ERRB_WORLD', 'ERRTHETA_WORLD',
         # PSF shape
-        'FWHM_IMAGE', 'A_IMAGE', 'B_IMAGE', 'ELLIPTICITY',
+        'FWHM_WORLD', 'FWHM_IMAGE',
+        'A_IMAGE', 'B_IMAGE',
+        'THETA_IMAGE', 'ELLIPTICITY',
         'CLASS_STAR'
         ]
     sex_default = {
+            'FILTER_NAME': 'default.conv',
             'STARNNW_NAME': 'default.nnw',
             'WRITE_XML': 'N',
             'BACKPHOTO_TYPE': 'LOCAL',
-            'PIXEL_SCALE': '0',
+            'PIXEL_SCALE': 0,
             'HEADER_SUFFIX': '.none',
             'GAIN_KEY': 'bug_of_sex_219',
+            'NTHREADS': 0,
             }
     scamp_default = {
             'CHECKPLOT_RES': '1024',
@@ -54,7 +58,7 @@ class AmConfig(object):
             'DELETE_TMPFILES': 'N',
             'NOPENFILES_MAX': '1000000',
             }
-    scratch_dir = '/mnt/Scratch/swarp_resamp'
+    scratch_dir = '/tmp'
     path_prefix = '/usr'
 
     def __init__(self, **kwargs):
@@ -68,10 +72,10 @@ class AmConfig(object):
         self.overrides = overrides
         self.share_dir = os.path.join(self.get('path_prefix'), 'share')
         self.bin_dir = os.path.join(self.get('path_prefix'), 'bin')
-        for sname, lname in [('sex', 'sextractor'),
-                             ('scamp', 'scamp'),
-                             ('swarp', 'swarp')]:
-            for i in ['bin', 'share']:
+        for i in ['bin', 'share']:
+            for sname, lname in [('sex', 'sextractor'),
+                                 ('scamp', 'scamp'),
+                                 ('swarp', 'swarp')]:
                 if sname == 'sex' and i == 'bin':
                     lname = 'sex'  # sextractor binary naming
                 setattr(self, '{0}{1}'.format(sname, i),

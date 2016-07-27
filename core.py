@@ -16,11 +16,14 @@ import sys
 import glob
 import time
 import logging
-import StringIO
+import cPickle as pickle
+from StringIO import StringIO
 import subprocess
+from copy import copy
 from functools import wraps    # enable pickling of decorator
 from datetime import timedelta
 # from collections import Iterable
+# from tempfile import NamedTemporaryFile
 
 import ruffus
 import ruffus.cmdline as cmdline
@@ -33,7 +36,7 @@ from ruffus import output_from
 from ruffus.ruffus_exceptions import error_ambiguous_task
 import env
 import utils
-import func
+import common
 
 
 def ensure_list(value, tuple_as_list=False):
@@ -56,19 +59,6 @@ def ensure_list(value, tuple_as_list=False):
     return value
 
 
-def ensure_args_as_list(*iargs, **ikwargs):
-    """wrap string argument as list"""
-    def wrapper(func):
-        @wraps(func)
-        def wrapped_func(*args, **kwargs):
-            newargs = list(args)
-            for i in iargs:
-                newargs[i] = ensure_list(args[i], **ikwargs)
-            return func(*newargs, **kwargs)
-        return wrapped_func
-    return wrapper
-
-
 def unwrap_if_len_one(arg):
     return arg if len(arg) > 1 else arg[0]
 
@@ -78,7 +68,8 @@ class ApusConfig(object):
 
     dirs = [
         ('jobdir', None), ('confdir', '{jobdir:s}'), ('diagdir', '{jobdir:s}'),
-        ('task_io_default_dir', '{jobdir:s}')
+        ('task_io_default_dir', '{jobdir:s}'),
+        ('logdir', ''),
         ]
     specs = [('jobkey', None), ('inputs', []), ('tlist', [])]
     runtime = [
@@ -88,6 +79,8 @@ class ApusConfig(object):
         ]
 
     def __init__(self, config):
+        # mark the begin time
+        self.timestamp = time.time()
         missingkeyerror = "missing key in config module: {0}"
         for key, defval in self.dirs + self.specs + self.runtime:
             try:
@@ -102,7 +95,8 @@ class ApusConfig(object):
             setattr(self, key, val)
 
     def get_dirs(self):
-        return list(set(getattr(self, k) for k in dict(self.dirs).keys()))
+        return [d for d in set(getattr(self, k)
+                for k in dict(self.dirs).keys()) if d != '']
 
     def get_task_names(self):
         return [t['name'] for t in self.tlist]
@@ -145,8 +139,8 @@ def configure(config, args):
             help='run a slice of inputs for testing purpose')
     parser.set_defaults(
             verbose=['0', ],
-            log_file=apusconf.log_file,
-            history_file=apusconf.history_file
+            log_file=os.path.join(apusconf.logdir, apusconf.log_file),
+            history_file=os.path.join(apusconf.logdir, apusconf.history_file)
             )
     option = parser.parse_args(args)
     # handle logger
@@ -211,13 +205,27 @@ def sliced_glob(pattern, slice_ranges):
     return list(set(ret))
 
 
+def normalize_am_params(params):
+    for k, v in params.items():
+        if isinstance(v, list):
+            v = ', '.join(map(str, v))
+        else:
+            v = str(v)
+        params[k] = v
+    return params
+
+
+def normalize_task_name(name):
+    return name.replace(' ', '_')
+
+
 def create_ruffus_task(pipe, config, task, **kwargs):
     """create Ruffus task from the task dictionary and add to pipe
 
     keys: name, func, pipe, [in_, out]
     optional task keys: add_inputs, replace_inputs,
                         allow_slice, in_keys, out_keys,
-    optional context keys: allow_finish_silently, dry_run
+    optional context keys: verbose, dry_run
     """
 
     # validate the task dict first
@@ -225,19 +233,8 @@ def create_ruffus_task(pipe, config, task, **kwargs):
     for key in ['name', 'func', 'pipe', ['in_', 'out']]:
         if all(k not in task.keys() for k in ensure_list(key)):
             raise RuntimeError(missingkeyerror.format(key))
+    config = copy(config)
     config.__dict__.update(**kwargs)
-
-    # context is parameters that are passed to the task function
-    context_exclude_task_keys = [
-            'pipe', 'in_', 'out', 'add_inputs', 'allow_slice']
-    context_key_defaults = {
-            'allow_finish_silently': False,
-            'dry_run': config.dry_run,
-            }
-    context = {k: v for k, v in task.items() + context_key_defaults.items()
-               if k not in context_exclude_task_keys}
-    for key, defval in context_key_defaults.items():
-        context[key] = task.get(key, defval)
 
     # process task dict
     task_name_list = config.get_task_names()
@@ -248,10 +245,44 @@ def create_ruffus_task(pipe, config, task, **kwargs):
 
     task_args = []
     task_kwargs = {'name': task_name, 'task_func': task_func}
-
+    # handle follows
+    task_follows = [t['name'] if isinstance(t, dict) else t
+                    for t in ensure_list(task.get('follows', []))]
+    # additional logic for astromatic tasks
+    if task_func.__name__ == 'astromatic_task':
+        task['params'] = normalize_am_params(task.get('params', {}))
+        # generate configuration file if not supplied
+        if 'conf' not in ensure_list(task.get('in_keys', None)):
+            pre_task = {
+                'name': 'auto config {0}'.format(task_name),
+                'func': dump_config_files,
+                'pipe': 'originate',
+                'out': os.path.join(config.confdir, 'conf.{0}'.format(
+                        normalize_task_name(task_name))),
+                'extras': os.path.join(
+                    config.confdir,
+                    'conf.{0}.checker'.format(normalize_task_name(task_name))),
+                'params': task.pop('params'),  # remove params from this task
+                'outparams': task.get('outparams', []),
+                'verbose': False,
+                # 'check_if_uptodate': check_config_uptodate,
+                'diagdir': config.diagdir,
+                'prog': get_am_prog(task['func']),
+                'jobs_limit': 1
+                }
+            create_ruffus_task(
+                pipe, config, pre_task, task_io_default_dir='')
+            task_follows.append(pre_task['name'])
+            # connect pre_task to this
+            conf_inputs = task.get('extras', [])
+            conf_inputs.append(os.path.abspath(pre_task['out']))
+            task_inkeys = task.get('in_keys', ['in', ])
+            task_inkeys.append('conf')
+            task['extras'] = conf_inputs
+            task['in_keys'] = task_inkeys
     # handle input
     formatter_inputs, simple_inputs, generator_inputs = aggregate_task_inputs(
-            ensure_list(task['in_'], tuple_as_list=False))
+            ensure_list(task.get('in_', []), tuple_as_list=False))
     if len(generator_inputs) > 0:  # generator_inputs goes to unnamed argument
             task_args.extend(generator_inputs)
     # simple_inputs get common general formatter
@@ -301,15 +332,21 @@ def create_ruffus_task(pipe, config, task, **kwargs):
             task_kwargs['input'] = unwrap_if_len_one(task_inputs)
         if task['pipe'] != 'merge':  # require formatter for non-merge pipe
             task_kwargs['filter'] = formatter(*task_formatters)
+
+    def resolve_task_name(s):
+        if isinstance(s, dict):
+            s = s['name']
+        if s in task_name_list:
+            try:  # have to replace task name with task
+                s, = pipe.lookup_task_from_name(s, "__main__")
+            except (ValueError, error_ambiguous_task):
+                pass
+        return s
     # handle additional inputs and replace_inputs
     for inkey in ['add_inputs', 'replace_inputs']:
         task_inkey = []
         for in_ in ensure_list(task.get(inkey, None)):
-            if in_ in task_name_list:
-                try:  # have to replace task name with task
-                    in_, = pipe.lookup_task_from_name(in_, "__main__")
-                except (ValueError, error_ambiguous_task):
-                    pass
+            in_ = resolve_task_name(in_)
             if isinstance(in_, str) and not os.path.isabs(in_):
                 in_ = os.path.join(config.task_io_default_dir, in_)
             task_inkey.append(in_)
@@ -326,13 +363,7 @@ def create_ruffus_task(pipe, config, task, **kwargs):
     else:  # flag file for checkpointing
         task_kwargs['output'] = os.path.join(
             config.task_io_default_dir,
-            task_name.replace(' ', '_') + '.success')
-    # handle follows
-    task_follows = [t['name'] if isinstance(t, dict) else t
-                    for t in ensure_list(task.get('follows', []))]
-    if 'follows' in context.keys():
-        # for cleaner debug info
-        context['follows'] = unwrap_if_len_one(task_follows)
+            normalize_task_name(task_name) + '.success')
     # handle context as extra
     task_extras = []
     for extra in ensure_list(task.get('extras', None)):
@@ -340,6 +371,22 @@ def create_ruffus_task(pipe, config, task, **kwargs):
             task_extras.append(os.path.join(config.task_io_default_dir, extra))
         else:
             task_extras.append(extra)
+    # context is parameters that are passed to the task function
+    context_exclude_task_keys = [
+            'pipe', 'in_', 'out', 'add_inputs', 'allow_slice']
+    context_key_defaults = {
+            'verbose': True,
+            'dry_run': False,
+            }
+    context = {k: v for k, v in task.items() + context_key_defaults.items()
+               if k not in context_exclude_task_keys}
+    for key, defval in context_key_defaults.items():
+        context[key] = task.get(key, defval)
+    if config.dry_run:
+        context['dry_run'] = True
+    if 'follows' in context.keys():
+        # for cleaner debug info
+        context['follows'] = unwrap_if_len_one(task_follows)
     task_context = {
             'task': context,
             'logger': config.logger,
@@ -349,19 +396,6 @@ def create_ruffus_task(pipe, config, task, **kwargs):
     task_kwargs['extras'] = task_extras
     # create ruffus task
     ruffus_task = pipe_func(*task_args, **task_kwargs)
-    # additional follows for astromatic task if no input config is supplied
-    if task_func.__name__ == 'astromatic_task' and \
-            'conf' not in ensure_list(task.get('in_keys', None)):
-        pre_task = {
-                'name': 'config {0}'.format(task_name),
-                'func': func.dump_config_files,
-                'pipe': 'originate',
-                'out': os.path.join(config.confdir, 'conf.{0}'.format(
-                        task_name.replace(' ', '_'))),
-                'params': task['params']
-                }
-        task_follows.append(create_ruffus_task(
-            pipe, config, pre_task, task_io_default_dir=''))
     if len(task_follows) > 0:
         ruffus_task.follows(*task_follows)
     # handle job_limit
@@ -370,6 +404,9 @@ def create_ruffus_task(pipe, config, task, **kwargs):
         ruffus_task.jobs_limit(jobs_limit)
     # add finish signal
     ruffus_task.posttask(task_finish_signal(task_name, config))
+    # handle forced run
+    if task.get('check_if_uptodate', None) is not None:
+        ruffus_task.check_if_uptodate(task['check_if_uptodate'])
     return ruffus_task
 
 
@@ -397,27 +434,27 @@ def build_init_pipeline(config, option):
             name += ' {0}'.format(i + 1)
         tlist.append({
             'name': name,
-            'func': func.create_symbolic_link,
+            'func': common.create_symbolic_link,
             'pipe': 'transform',
             'in_': (in_, reg),
             'out': out,
-            'allow_finish_silently': True,
+            'verbose': False,
             'allow_slice': True,
             'follows': t00,
             })
     if len(simple_inputs) > 0:
         tlist.append({
             'name': 'link simple inputs',
-            'func': func.create_symbolic_link,
+            'func': common.create_symbolic_link,
             'pipe': 'transform',
             'in_': simple_inputs,
             'out': os.path.join(config.jobdir, '{basename[0]}{ext[0]}'),
-            'allow_finish_silently': True,
+            'verbose': False,
             'follows': t00,
             })
     # t03 = {
     #         'name': 'link per input extras',
-    #         'func': func.create_symbolic_link,
+    #         'func': common.create_symbolic_link,
     #         'type_': 'files',
     #         'follows': t00['name'],
     #         }
@@ -472,8 +509,7 @@ def bootstrap():
     if len(option.forced_tasks) > 0:
         for t in option.forced_tasks:
             config.logger.info("forced redo: {0}".format(utils.alert(t)))
-    # mark the begin time
-    config.timestamp = time.time()
+
     cmdline.run(option, checksum_level=1)
 
 
@@ -551,16 +587,9 @@ def task_finish_signal(task_name, config):
     return ret_task_finish_signal
 
 
-@ensure_args_as_list(0)
-def touch_file(out_files):
-    for out in out_files:
-        with open(out, 'a'):
-            os.utime(out, None)
-
-
-@ensure_args_as_list(0)
-def get_flagfile(out_files):
-    if len(out_files) == 1 and '.success' in out_files[0]:
+def get_flag_file(out_files):
+    suffix = '.success'
+    if len(out_files) == 1 and out_files[0][-len(suffix):] == suffix:
         flag = out_files[0]
         out_files = []
     else:
@@ -568,50 +597,115 @@ def get_flagfile(out_files):
     return out_files, flag
 
 
-def documented_subprocess_call(command, flag=None):
-    def call(*args, **kwargs):
-        # handle scamp refcatalog suffix
-        if '-ASTREFCAT_NAME' in command:
-            ikey = command.index('-ASTREFCAT_NAME') + 1
-            refcatkey = command[ikey]
-            refcatfiles = glob.glob(
-                    "{0}_?{1}".format(*os.path.splitext(refcatkey)))
-            if len(refcatfiles) == 0:
-                refcatfiles = glob.glob(refcatkey)
-            if len(refcatfiles) > 0:
-                command[ikey] = ','.join(refcatfiles)
-        log = func.get_log_func(**kwargs)
-        # output = subprocess.check_output(command)
-        proc = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, bufsize=1)
-        has_output = False
-        for ln in iter(proc.stdout.readline, b''):
-            if ln:
-                has_output = True
-            log('debug', ln.strip('\n'))
-        if proc.poll() is not None and proc.returncode != 0:
-            # an error happened!
-            err_msg = "%s\nsubprocess failed with code: %s" % (
-                    proc.stderr.read(), proc.returncode)
-            raise RuntimeError(err_msg)
-        if flag is not None:
-            with open(flag, 'w'):
-                pass
-        return has_output
-        # return output
-    # print(' '.join(command))
-    call.__doc__ = 'subprocess: ' + ' '.join(command)
-    return call
+def get_am_prog(func):
+    program = [i for i in ['sex', 'scamp', 'swarp']
+               if func.lower().startswith(i)][0]
+    return program
+
+
+def ensure_args_as_list(*iargs, **ikwargs):
+    """wrap string argument as list"""
+    def wrapper(func):
+        @wraps(func)
+        def wrapped_func(*args, **kwargs):
+            newargs = list(args)
+            for i in iargs:
+                newargs[i] = ensure_list(args[i], **ikwargs)
+            return func(*newargs, **kwargs)
+        return wrapped_func
+    return wrapper
+
+
+def to_callable_task_args(conv_func):
+    def wrapper(func):
+        @wraps(func)
+        def wrapped_func(in_files, out_files, *extras):
+            if len(extras) == 0:  # from originate, rename the variables
+                in_files, out_files, extras = [], in_files, out_files
+            in_files += extras[:-1]
+            out_files, flag_file = get_flag_file(out_files)
+            overlap = list(set(in_files).intersection(out_files))
+            if len(overlap) > 0:
+                raise RuntimeError(
+                        'danger: output {0} has same filename as inputs'
+                        .format(unwrap_if_len_one(overlap)))
+            context = copy(extras[-1])
+            context['flag_file'] = flag_file
+            if conv_func is not None:
+                # copy task as well
+                context['task'] = dict(context['task'], func=conv_func(
+                        in_files, out_files, context))
+            return func(in_files, out_files, context)
+        return wrapped_func
+    return wrapper
+
+
+def _subprocess_callable(in_files, out_files, context):
+    if any(isinstance(i, tuple) for i in in_files):
+        if len(in_files) > 1:
+            # raise RuntimeError(
+            #     "subprocess task should not have nested inputs")
+            in_files = [i for j in in_files for i in j]
+        else:
+            in_files = in_files[0]
+    command = context['task']['func'].split()
+    for key, value in zip(['{in}', '{out}'], [in_files, out_files]):
+        if key in command:
+            i = command.index(key)
+            command[i:i + 1] = value
+    return documented_subprocess_call(command, flag_file=context['flag_file'])
+
+
+@ensure_args_as_list(0, 1, tuple_as_list=True)
+@to_callable_task_args(_subprocess_callable)
+def subprocess_task(in_files, out_files, context):
+    """run command as subprocess by replacing func key in task context
+    with callable"""
+    return callable_task(in_files, out_files, context)
+
+
+def _astromatic_callable(in_files, out_files, context):
+    """return the command for executing astromatic task"""
+    task = context['task']
+    # get program
+    prog = get_am_prog(task['func'])
+    # split up inputs types
+    rectified_inputs = get_astromatic_inputs(in_files, task['in_keys'])
+    command = [env.am.get('{0}bin'.format(prog)), ]
+    params = {}
+    for key, val in rectified_inputs:
+        # here val is a list of values
+        if key == 'in':
+            command.extend(val)
+        elif key == 'conf':
+            if len(val) < 1:
+                raise RuntimeError('no configuration file specified for {0}'
+                                   .format(task['func']))
+            else:
+                command.extend(['-c', val[0]])
+                params.update(utils.parse_astromatic_conf(*val[1:]))
+        else:  # values should be concat by comma
+            params[key] = ','.join(val)
+    params.update(task.get('params', {}))
+    for key, val in params.items():
+        command.extend(['-{0}'.format(key), '"{0}"'.format(val)])
+    # handle outkeys
+    default_outkeys = {
+            'sex': ['CATALOG_NAME', ],
+            'scamp': [],
+            'swarp': ['IMAGEOUT_NAME', 'WEIGHTOUT_NAME']
+            }
+    out_keys = task.get('out_keys', default_outkeys[prog])
+    for i, key in enumerate(out_keys):
+        command.extend(['-{0}'.format(key), out_files[i]])
+    return documented_subprocess_call(command, flag_file=context['flag_file'])
 
 
 @ensure_args_as_list(0, 1)
-def astromatic_task(in_files, out_files, *extras):
+@to_callable_task_args(_astromatic_callable)
+def astromatic_task(in_files, out_files, context):
     """create astromatic command to run by subprocess"""
-    in_files.extend(extras[:-1])
-    context = extras[-1]
-    task = dict(context['task'], func=get_astromatic_callable(
-            in_files, out_files, context))
-    return callable_task(in_files, out_files, dict(context, task=task))
+    return callable_task(in_files, out_files, context)
 
 
 def get_astromatic_inputs(inputs, in_keys):
@@ -664,279 +758,171 @@ def get_astromatic_inputs(inputs, in_keys):
     return zip(ag_keys, ag_vals)
 
 
-def get_astromatic_callable(in_files, out_files, context):
-    """return the command for executing astromatic task"""
-    task = context['task']
-    # ensure there is a flag file at least for check pointing
-    out_files, flag = get_flagfile(out_files)
-    # get program
-    program = [i for i in ['sex', 'scamp', 'swarp']
-               if task['func'].lower().startswith(i)][0]
-    # split up inputs types
-    rectified_inputs = get_astromatic_inputs(in_files,
-                                             task.get('in_keys', ['in', ]))
-    command = [env.am.get('{0}bin'.format(program)), ]
-    params = {}
-    for key, val in rectified_inputs:
-        # here val is a list of values
-        if key == 'in':
-            command.extend(val)
-        elif key == 'conf':
-            if len(val) < 1:
-                raise RuntimeError('no configuration file specified for {0}'
-                                   .format(task['func']))
-            else:
-                command.extend(['-c', val[0]])
-                params.update(utils.parse_astromatic_conf(*val[1:]))
-        else:  # values should be concat by comma
-            params[key] = ','.join(val)
-    params.update(task.get('params', {}))
-    for key, val in params.items():
-        command.extend(['-{0}'.format(key), '"{0}"'.format(val)])
-    # handle outkeys
-    default_outkeys = {
-            'sex': ['CATALOG_NAME', ],
-            'scamp': [],
-            'swarp': ['IMAGEOUT_NAME', 'WEIGHTOUT_NAME']
-            }
-    out_keys = task.get('out_keys', default_outkeys[program])
-    for i, key in enumerate(out_keys):
-        command.extend(['-{0}'.format(key), out_files[i]])
-    # handle out_files
-    # if program == 'sex':
-    #     outkey = ensure_list(task.get('outkey', 'CATALOG_NAME'))
-    # elif program == 'scamp':
-    #     outkey = ensure_list(task.get('outkey', {}))
-    #     # handle output catalog name suffix
-    #     if len(outkey) == 1 and outkey[0] == 'MERGEDOUTCAT_NAME':
-    #         flag = out_files[0]
-    # elif program == 'swarp':
-    #     if len(out_files) == 1:
-    #         out_files.append(out_files[0].replace('.fits', '.weight.fits'))
-    #     outkey = ensure_list(task.get('outkey',
-    #                          ['IMAGEOUT_NAME', 'WEIGHTOUT_NAME']))
-    # for i, key in enumerate(outkey):
-    #     command.extend(['-' + key, out_files[i]])
-    # handle multiple in_files
-    # scheme: [dectect] image [weight1, weight2, ...]
-    # if program == 'sex':
-    #     if params.get('WEIGHT_TYPE', 'NONE') != 'NONE':
-    #         n_weight = len(params['WEIGHT_TYPE'].split(','))
-    #         weight = ensure_list(params.pop('WEIGHT_IMAGE', []))
-    #         while len(weight) < n_weight:
-    #             weight.insert(0, in_files.pop())
-    #         command.extend(['-WEIGHT_IMAGE', ','.join(weight)])
-    # elif program == 'scamp':
-    #     if params.get('ASTREF_CATALOG', None) is not None and \
-    #             params['ASTREF_CATALOG'] == 'FILE':
-    #         # the last input is the catalog key
-    #         refcatkey = in_files.pop()
-    #         command.extend(['-ASTREFCAT_NAME', refcatkey])
-    # elif program == 'swarp':
-    #     # input looks like [[], [], ...]
-    #     # [img, wht, head]
-    #     _in_files = zip(*in_files)
-    #     if params.get('WEIGHT_TYPE', 'NONE') != 'NONE':
-    #         img, wht = _in_files[:2]
-    #         hdr = _in_files[2] if len(_in_files) > 2 else None
-    #     else:
-    #         img, wht = _in_files[0], None
-    #         hdr = _in_files[1] if len(_in_files) > 1 else None
-    #     in_files = img
-    #     if wht is not None:
-    #         command.extend(['-WEIGHT_IMAGE', ','.join(wht)])
-    #     if hdr is not None:  # create sym link
-    #         for (i, h) in zip(img, hdr):
-    #             lnh = '{0}{1}'.format(os.path.splitext(i)[0],
-    #                                   params.get('HEADER_SUFFIX', '.head'))
-    #             subprocess.call(['ln', '-sf', os.path.abspath(h), lnh])
-    # for k, v in params.items():
-    #     command.extend(['-{0}'.format(k), v])
-    # command.extend(in_files)
-    return documented_subprocess_call(command, flag=flag)
-
-
 @ensure_args_as_list(0, 1)
-def subprocess_task(in_files, out_files, *extras):
-    """run command as subprocess by replacing func key in task context
-    with callable
-    extras: extra inputs, task context
-    """
-    in_files.extend(extras[:-1])
-    context = extras[-1]
-    task = dict(context['task'], func=get_subprocess_callable(
-            in_files, out_files, context))
-    return callable_task(in_files, out_files, dict(context, task=task))
-
-
-def get_subprocess_callable(in_files, out_files, context):
-    if any(isinstance(i, tuple) for i in in_files):
-        if len(in_files) > 1:
-            raise RuntimeError("subprocess task should not have nested inputs")
-        else:
-            in_files = in_files[0]
-    out_files, flag = get_flagfile(out_files)
-    command = context['task']['func'].split()
-    for key, value in zip(['{in}', '{out}'], [in_files, out_files]):
-        if key in command:
-            i = command.index(key)
-            command[i:i + 1] = value
-    # command = task['func'] + in_files + out_files
-    return documented_subprocess_call(command, flag=flag)
-
-
-@ensure_args_as_list(0, 1)
-def callable_task(in_files, out_files, *extras):
-    in_files.extend(extras[:-1])
-    context = extras[-1]
+@to_callable_task_args(None)
+def callable_task(in_files, out_files, context):
     task, logger, logger_mutex = [
             context[i] for i in ['task', 'logger', 'logger_mutex']]
     func = task['func']
+    args = in_files + out_files
+    dry_run = task.get('dry_run', False)
+    verbose = task.get('verbose', True)
     if func.__doc__.startswith('subprocess: '):
-        mesg = func.__doc__[len('subprocess: '):]
+        caller_string = func.__doc__[len('subprocess: '):]
     else:
-        mesg = "{0}({1}, {2})".format(func.__name__, in_files, out_files)
-    if task.get('dry_run', False):
-        output = '~dry~run~3~sec: {0}'.format(mesg)
-        time.sleep(1)
-        touch_file(out_files)
-    else:
+        caller_string = "{0}({1})".format(func.__name__, ', '.join(args))
+    if dry_run:
+        caller_string = "~dry~run~1~sec: " + caller_string
+    if verbose:
         with logger_mutex:
-            logger.debug(mesg)
-        kwargs = {'task': task, 'logger': logger, 'logger_mutex': logger_mutex}
-        output = func(unwrap_if_len_one(in_files),
-                      unwrap_if_len_one(out_files),
-                      **kwargs)
-    if not output and task.get('allow_finish_silently', False):
-        pass
+            logger.debug(caller_string)
+    if dry_run:
+        time.sleep(1)
+        map(common.touch_file, out_files)
+        output = '~dry~run~touched: {0}'.format(', '.join(out_files))
     else:
-        output = "finished silently" if not output else "finished"
+        kwargs = {'task': task, 'logger': logger, 'logger_mutex': logger_mutex}
+        output = func(*args, **kwargs)
+    if output or verbose:
+        output = "finished silently" if not output else 'finished'
         with logger_mutex:
             logger.debug(output)
 
 
-# OBSOLETE
-def get_amprog(string):
-    """naming convention of the astromatic task key: sex_suffix"""
-    prog = string.split('_', 1)[0]
-    return prog
+def dump_config_files(conf_file, checker_file, **kwargs):
+    """create configuration file"""
 
-
-def get_amsuffix(string):
-    """naming convention of the astromatic task key: sex_suffix"""
-    if '_' in string:
-        return string.split('_', 1)[-1]
-    else:
-        return ""
-
-
-def get_amconf(key):
-    """naming convention of astromatic configuration file"""
-    return 'conf.{0}'.format(key)
-
-
-def am_config_default(prog):
+    logger, logger_mutex = kwargs['logger'], kwargs['logger_mutex'],
+    task = kwargs['task']
+    prog = task['prog']
+    am_bin = env.am.get('{0}bin'.format(prog))
+    am_share = env.am.get('{0}share'.format(prog))
+    # handle parameters
+    conf_params = dict(env.am.get('{0}_default'.format(prog)),
+                       **task.get('params', {}))
     if prog == 'sex':
-        return {'STARNNW_NAME': 'default.nnw',
-                'WRITE_XML': 'N',
-                'BACKPHOTO_TYPE': 'LOCAL',
-                'PIXEL_SCALE': '0',
-                'HEADER_SUFFIX': '.none'}
+        if 'PARAMETERS_NAME' not in task.get('in_keys', []):
+            params_file = conf_params.get('PARAMETERS_NAME', None)
+            if params_file is None or not os.path.isfile(params_file):
+                params_file_keys = task.get('outparams', [])
+                params_file = conf_file + '.sexparam'
+                with logger_mutex:
+                    logger.info('params file: {0}'.format(params_file))
+                fo = StringIO(subprocess.check_output([am_bin, '-dp']))
+                utils.dump_sex_param(
+                        fo, params_file, env.am.get('sexparam_default'),
+                        params_file_keys, clobber=True)
+                # with logger_mutex:
+                #     logger.info("keys: {0}".format(', '.join(keys)))
+                fo.close()
+                conf_params['PARAMETERS_NAME'] = params_file
     elif prog == 'scamp':
-        return {'CHECKPLOT_RES': '1024',
-                'SAVE_REFCATALOG': 'Y',
-                'WRITE_XML': 'Y',
-                }
+        conf_params['CHECKPLOT_NAME'] =\
+            utils.get_scamp_checkplot_name(
+                    os.path.abspath(task['diagdir']),
+                    prefix=normalize_task_name(task['name']))
     elif prog == 'swarp':
-        return {'INTERPOLATE': 'N',
-                'FSCALASTRO_TYPE': 'VARIABLE',
-                'DELETE_TMPFILES': 'N',
-                'NOPENFILES_MAX': '1000000',
-                }
-
-
-def dump_configuration_files(flag_file, config):
-    """Dump AstrOmatic configuration files
-
-    :config: config object
-    """
-
-    logger, logger_mutex = config.logger, config.logger_mutex
-    confdir = config.confdir
-    am_diagdir = config.am_diagdir
-    am_sharedir = config.am_sharedir
-    am_resampdir = config.am_resampdir
-    am_params = config.am_params
-    # aggregate keys by program: sex -> sex_1, sex_2 ...
-    # merge param to per_task_params
-    global_params = {}
-    per_task_params = {}
-    has_per_task_params = dict(sex=0, scamp=0, swarp=0)
-    for key in am_params.keys():
-        program = get_amprog(key)
-        if '_' in key:
-            per_task_params[key] = am_params[key]
-            _d = am_config_default(program)
-            _d.update(**am_params.get(program, {}))
-            _d.update(**per_task_params[key])
-            per_task_params[key] = _d
-            has_per_task_params[program] += 1
+        if conf_params.get('RESAMPLE_DIR', None) is None:
+            conf_params['RESAMPLE_DIR'] = env.am.get('scratch_dir')
+    # convert to strings
+    # use absolute file paths whenever possible
+    for k, v in conf_params.items():
+        if isinstance(v, list):
+            v = ', '.join(map(str, v))
         else:
-            global_params[key] = dict(am_config_default(program),
-                                      **am_params[key])
-    for k, v in has_per_task_params.items():
-        if v == 0 and k in global_params.keys():
-            per_task_params[k] = global_params[k]
-
-    # create configuration files and set up the path
-    for key, param in per_task_params.items():
-        program = get_amprog(key)  # e.g. sex for sex_astro
-        am_bin = config.get('{0}bin'.format(program), None)
-        if am_bin is None:
-            raise ValueError('path to executable for {0} is not defined'
-                             .format(program))
-        # default am_share directory
-        if config.am_sharedir is None:
-            am_sharedir = env.am.get('{0}share'.format(program))
-        # generate filenames
-        conffile = get_amconf(key)
-        if program == 'sex':  # both conf and param
-            paramfile = conffile + '.param'
-            param['PARAMETERS_NAME'] = os.path.join(confdir, paramfile)
-        if program == 'scamp':
-            amsuffix = get_amsuffix(key)
-            param['CHECKPLOT_NAME'] =\
-                utils.get_scamp_checkplot_name(os.path.abspath(am_diagdir),
-                                               prefix=amsuffix)
-        elif program == 'swarp' and \
-                param.get('RESAMPLE_DIR', None) is None:
-            param['RESAMPLE_DIR'] = am_resampdir
-        # use absolute dir whenever possible
-        for k, v in param.items():
+            v = str(v)
+        conf_params[k] = v
+        if re.search('[/.]', v) is not None:  # only replace file-like vals
             if os.path.isfile(v):
-                param[k] = os.path.abspath(v)
-            elif os.path.isfile(os.path.join(am_sharedir, v)):
-                param[k] = os.path.abspath(os.path.join(am_sharedir, v))
-            elif os.path.isfile(os.path.join(confdir, v)):
-                param[k] = os.path.abspath(os.path.join(confdir, v))
+                conf_params[k] = os.path.abspath(v)
+            elif os.path.isfile(os.path.join(am_share, v)):
+                conf_params[k] = os.path.abspath(os.path.join(am_share, v))
             else:
-                param[k] = v
-        # create config and param
-        conffile = os.path.join(confdir, conffile)
-        fo = StringIO.StringIO(subprocess.check_output([am_bin, '-dd']))
-        utils.dump_astromatic_conf(fo, conffile, clobber=True, **param)
-        with logger_mutex:
-            logger.info('dump conf: {0}'.format(conffile))
-            for k, v in param.items():
-                logger.info('{0:>20s}: {1:s}'.format(k, v))
-        fo.close()
-        if program == 'sex':
-            paramfile = os.path.join(confdir, paramfile)
-            fo = StringIO.StringIO(subprocess.check_output([am_bin, '-dp']))
-            utils.dump_sex_param(fo, paramfile, clobber=True)
-            with logger_mutex:
-                logger.info('dump param: {0}'.format(paramfile))
-            fo.close()
-    # write flag file
-    with open(flag_file, 'w'):
-        pass
+                conf_params[k] = v
+    # create conf file
+    fo = StringIO(subprocess.check_output([am_bin, '-dd']))
+    utils.dump_astromatic_conf(fo, conf_file, clobber=True, **conf_params)
+    with logger_mutex:
+        logger.info('conf file: {0}'.format(conf_file))
+        for k, v in conf_params.items():
+            if os.path.isfile(v):
+                v = os.path.relpath(v)
+            logger.info('{0:>20s}: {1:s}'.format(k, v))
+    fo.close()
+    # write checker file
+    with open(checker_file, 'w') as fo:
+        pickle.dump(task.get('params', {}), fo)
+        pickle.dump(task.get('outparams', {}), fo)
+
+
+def check_config_uptodate(*args, **kwargs):
+    conf_file, checker_file, context = args[-3:]
+    for f in [conf_file, checker_file]:
+        if not os.path.isfile(f):
+            return True, "missing file {0}".format(f)
+    task = context['task']
+    with open(checker_file, 'r') as fo:
+        old_params = pickle.load(fo)
+        old_outparams = pickle.load(fo)
+    new_params = task.get('params', {})
+    new_outparams = task.get('outparams', [])
+    if len(new_params) != len(old_params) or \
+            len(new_outparams) != len(old_outparams):
+        return True, 'params/outparams changed its size'
+    for key, val in new_params.items():
+        if key in old_params.keys() and old_params[key] == val:
+            continue
+        else:
+            return True, 'params dict changed its content'
+    else:
+        overlap = list(set(new_outparams).intersection(old_outparams))
+        if len(overlap) == len(new_outparams):
+            return False, "no change of params/outparams"
+        else:
+            return True, 'outparams list changed its content'
+
+
+def documented_subprocess_call(command, flag_file=None):
+    def call(*args, **kwargs):
+        # handle scamp refcatalog suffix
+        if '-ASTREFCAT_NAME' in command:
+            ikey = command.index('-ASTREFCAT_NAME') + 1
+            refcatkey = command[ikey]
+            refcatfiles = glob.glob(
+                    "{0}_?{1}".format(*os.path.splitext(refcatkey)))
+            if len(refcatfiles) == 0:
+                refcatfiles = glob.glob(refcatkey)
+            if len(refcatfiles) > 0:
+                command[ikey] = ','.join(refcatfiles)
+        log = common.get_log_func(**kwargs)
+
+        # with NamedTemporaryFile() as fo:
+        #     subprocess.check_call(command, stdout=fo,
+        #                           stderr=subprocess.STDOUT)
+        #     fo.seek(0)
+        #     output = fo.read()
+        # output = subprocess.check_output(command)
+        proc = subprocess.Popen(command,
+                                stdout=subprocess.PIPE,
+                                bufsize=1,
+                                # stderr=subprocess.PIPE
+                                )
+        has_output = False
+        for ln in iter(proc.stdout.readline, b''):
+            if ln:
+                has_output = True
+            log('debug', ln.strip('\n'))
+        if proc.poll() is not None and proc.returncode != 0:
+            err_msg = "subprocess failed with code {0}".format(proc.returncode)
+            # an error happened!
+            # err_msg = "%s\nsubprocess failed with code: %s" % (
+            #         proc.stderr.read(),
+            #         proc.returncode)
+            raise RuntimeError(err_msg)
+        if flag_file is not None:
+            common.touch_file(flag_file)
+        return has_output
+        # return output
+    # print(' '.join(command))
+    call.__doc__ = 'subprocess: ' + ' '.join(command)
+    return call

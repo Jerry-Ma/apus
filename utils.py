@@ -113,32 +113,35 @@ def dump_astromatic_conf(infile, outfile, clobber=False, **kwargs):
 def dump_sex_param(infile, outfile, *args, **kwargs):
 
     logger = logging.getLogger(__name__)
-    common = [
-        'ALPHA_J2000', 'DELTA_J2000',
-        'X_IMAGE', 'Y_IMAGE',
-        'NUMBER', 'EXT_NUMBER',
-        'MAG_AUTO', 'MAGERR_AUTO', 'MAG_APER', 'MAGERR_APER',
-        'FLUX_AUTO', 'FLUXERR_AUTO', 'FLUX_APER', 'FLUXERR_APER',
-        'BACKGROUND', 'THRESHOLD',
-        'XWIN_IMAGE', 'YWIN_IMAGE',
-        'ERRAWIN_IMAGE', 'ERRBWIN_IMAGE', 'ERRTHETAWIN_IMAGE',
-        'X_WORLD', 'Y_WORLD',
-        'ERRA_WORLD', 'ERRB_WORLD', 'ERRTHETA_WORLD',
-        'FLAGS', 'FLAGS_WEIGHT', 'FLAGS_WIN',
-        'FWHM_IMAGE', 'ELLIPTICITY', 'CLASS_STAR']
+    err = 'Not a valid output para: {0:s}'
     if os.path.isfile(outfile) and not kwargs.get('clobber', False):
         raise ValueError("file exist:{0}".format(outfile))
-    with open(outfile, 'w') as fo:
-        content = infile.getvalue()
-        for key in common + list(args):
-            if key in content:
-                fo.write('{0:23s}  #\n'.format(key))
+    content = infile.getvalue()
+    # merge common with args: handle array-like keys
+    re_key = re.compile('(\w+)\s*(\(\s*\d+\s*\))?')
+    keys = []
+    for arg in args:
+        for key in arg:
+            match = re.match(re_key, key.strip())
+            if match is not None:
+                _key = match.groups()[0]
+                if _key not in content:
+                    raise ValueError(err.format(key))
+                if _key in keys:
+                    keys.index(_key)
+                    keys[keys.index(_key)] = key
+                else:
+                    keys.append(key)
             else:
-                raise ValueError('Not a valid output para: {0:s}'.format(key))
+                raise ValueError(err.format(key))
+    logger.info('output params: {0}'.format(', '.join(keys)))
+    with open(outfile, 'w') as fo:
+        for key in keys:
+            fo.write('{0:23s}  #\n'.format(key))
         fo.write('#' * 26 + '\n')
         fo.write(content)
     logger.info("+> {0:s}".format(outfile))
-    return outfile
+    return keys
 
 
 def sorted_glob(pattern):

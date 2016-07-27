@@ -5,7 +5,7 @@
 # Git Repo       :  https://github.com/Jerry-Ma
 # Email Address  :  jerry.ma.nk@gmail.com
 """
-func.py
+common.py
 
 A collection of useful pipeline building blocks
 """
@@ -25,6 +25,11 @@ def get_log_func(**kwargs):
             with logger_mutex:
                 getattr(logger, level)(mesg)
     return logfunc
+
+
+def touch_file(out_file):
+    with open(out_file, 'a'):
+        os.utime(out_file, None)
 
 
 def create_symbolic_link(in_file, out_file, **kwargs):
@@ -54,11 +59,3 @@ def create_symbolic_link(in_file, out_file, **kwargs):
         except Exception as e:
             log('info', 'cannot unlink {0}: {1}'.format(out_file, e))
     os.symlink(os.path.relpath(in_file, out_dir), out_file)
-
-
-def dump_config_files(out_file, **kwargs):
-    """create configuration file"""
-
-    log = get_log_func(**kwargs)
-    log('info', 'dump configuration {0}'.format(out_file))
-    print kwargs['params']
