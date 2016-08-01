@@ -188,3 +188,13 @@ def init_logging():
             },
         }
     })
+
+
+def join_tlist(*args):
+    if len(args) == 2:
+        p1, p2 = args
+        return p1 + (dict(p2[0], follows=p1[-1]), ) + p2[1:]
+    elif len(args) < 2:
+        raise RuntimeError("need at least two tlists to join")
+    else:
+        return join_tlist(join_tlist(*args[:-1]), args[-1])

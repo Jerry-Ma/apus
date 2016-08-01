@@ -46,8 +46,11 @@ def create_symbolic_link(in_file, out_file, **kwargs):
     out_file = os.path.abspath(out_file)
     in_dir = os.path.dirname(in_file)
     out_dir = os.path.dirname(out_file)
-    log('info', 'link {0} -> {1}'.format(os.path.relpath(in_file, out_dir),
-                                         out_file))
+    if kwargs.get('relpath', True):
+        src_path = os.path.relpath(in_file, out_dir)
+    else:
+        src_path = os.path.abspath(in_file)
+    log('info', 'link {0} -> {1}'.format(src_path, out_file))
     if in_dir == out_dir or in_file == out_file:
         raise RuntimeError('target and source are from the same directory {0}'
                            .format(in_dir))
@@ -58,4 +61,4 @@ def create_symbolic_link(in_file, out_file, **kwargs):
             os.unlink(out_file)
         except Exception as e:
             log('info', 'cannot unlink {0}: {1}'.format(out_file, e))
-    os.symlink(os.path.relpath(in_file, out_dir), out_file)
+    os.symlink(src_path, out_file)

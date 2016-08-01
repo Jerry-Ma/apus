@@ -50,13 +50,14 @@ class AmConfig(object):
     scamp_default = {
             'CHECKPLOT_RES': '1024',
             'SAVE_REFCATALOG': 'Y',
-            'WRITE_XML': 'Y',
+            'WRITE_XML': 'N',
             }
     swarp_default = {
             'INTERPOLATE': 'N',
             'FSCALASTRO_TYPE': 'VARIABLE',
             'DELETE_TMPFILES': 'N',
             'NOPENFILES_MAX': '1000000',
+            'WRITE_XML': 'N',
             }
     scratch_dir = '/tmp'
     path_prefix = '/usr'

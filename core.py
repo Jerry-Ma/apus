@@ -225,6 +225,7 @@ def create_ruffus_task(pipe, config, task, **kwargs):
     keys: name, func, pipe, [in_, out]
     optional task keys: add_inputs, replace_inputs,
                         allow_slice, in_keys, out_keys,
+                        kwargs
     optional context keys: verbose, dry_run
     """
 
@@ -265,7 +266,7 @@ def create_ruffus_task(pipe, config, task, **kwargs):
                 'params': task.pop('params'),  # remove params from this task
                 'outparams': task.get('outparams', []),
                 'verbose': False,
-                # 'check_if_uptodate': check_config_uptodate,
+                'check_if_uptodate': check_config_uptodate,
                 'diagdir': config.diagdir,
                 'prog': get_am_prog(task['func']),
                 'jobs_limit': 1
@@ -377,6 +378,7 @@ def create_ruffus_task(pipe, config, task, **kwargs):
     context_key_defaults = {
             'verbose': True,
             'dry_run': False,
+            'kwargs': {},
             }
     context = {k: v for k, v in task.items() + context_key_defaults.items()
                if k not in context_exclude_task_keys}
@@ -441,6 +443,7 @@ def build_init_pipeline(config, option):
             'verbose': False,
             'allow_slice': True,
             'follows': t00,
+            'kwargs': {'relpath': False},
             })
     if len(simple_inputs) > 0:
         tlist.append({
@@ -451,20 +454,8 @@ def build_init_pipeline(config, option):
             'out': os.path.join(config.jobdir, '{basename[0]}{ext[0]}'),
             'verbose': False,
             'follows': t00,
+            'kwargs': {'relpath': False},
             })
-    # t03 = {
-    #         'name': 'link per input extras',
-    #         'func': common.create_symbolic_link,
-    #         'type_': 'files',
-    #         'follows': t00['name'],
-    #         }
-    # def gen_per_input_extra():
-    #     for f in ensure_list(config.per_input_extra):
-    #         for in_ in config.inputs:
-    #             # @files doesn't propagate extra, so we pass them explicitly
-    #             yield list(f(in_)) + [t03, config.logger,
-    #                                   config.logger_mutex]
-    # t03['in_'] = gen_per_input_extra
     for t in tlist:
         create_ruffus_task(pipe, config, t, task_io_default_dir='')
 
@@ -781,7 +772,11 @@ def callable_task(in_files, out_files, context):
         map(common.touch_file, out_files)
         output = '~dry~run~touched: {0}'.format(', '.join(out_files))
     else:
-        kwargs = {'task': task, 'logger': logger, 'logger_mutex': logger_mutex}
+        kwargs = dict(
+                task['kwargs'],
+                task=task,
+                logger=logger,
+                logger_mutex=logger_mutex)
         output = func(*args, **kwargs)
     if output or verbose:
         output = "finished silently" if not output else 'finished'
@@ -877,6 +872,7 @@ def check_config_uptodate(*args, **kwargs):
     else:
         overlap = list(set(new_outparams).intersection(old_outparams))
         if len(overlap) == len(new_outparams):
+            # print out params
             return False, "no change of params/outparams"
         else:
             return True, 'outparams list changed its content'
