@@ -28,6 +28,7 @@ from datetime import timedelta
 import ruffus
 import ruffus.cmdline as cmdline
 from ruffus.proxy_logger import make_shared_logger_and_proxy
+# from ruffus import pipeline_printout_graph
 # from ruffus import mkdir
 from ruffus import Pipeline
 from ruffus import formatter
@@ -281,58 +282,64 @@ def create_ruffus_task(pipe, config, task, **kwargs):
             task_inkeys.append('conf')
             task['extras'] = conf_inputs
             task['in_keys'] = task_inkeys
+
     # handle input
-    formatter_inputs, simple_inputs, generator_inputs = aggregate_task_inputs(
-            ensure_list(task.get('in_', []), tuple_as_list=False))
-    if len(generator_inputs) > 0:  # generator_inputs goes to unnamed argument
-            task_args.extend(generator_inputs)
-    # simple_inputs get common general formatter
-    if len(simple_inputs) > 0:
-        formatter_inputs.append((simple_inputs, r'.+'))
-    # handle formatter_inputs
-    task_inputs = []
-    task_formatters = []
-    for in_, reg in formatter_inputs:
-        in_ = [i['name'] if isinstance(i, dict) else i
-               for i in ensure_list(in_)]
-        temp_in = []
-        temp_reg = reg
-        for i in in_:
-            if i in task_name_list:
-                temp_in.append(output_from(i))
-                continue
-            elif not os.path.isabs(i):  # prepend default io dir
-                i = os.path.join(config.task_io_default_dir, i)
-                temp_reg = r'(?:[^/]*/)*' + reg
-            else:
-                pass
-            if re.search(r'[?*,\[\]{}]', i) is not None:
-                # slice on flagged task with glob input
-                if config.slice_test is not None \
-                        and task.get('allow_slice', False):
-                    config.logger.info(
-                            'sliced glob input: {0} @ {1}'.format(
-                                i, ', '.join(map(str, config.slice_test))))
-                    sliced_files = sliced_glob(i, config.slice_test)
-                    if len(sliced_files) == 0:
-                        raise RuntimeError('no input left after slicing')
-                    for f in sliced_files:
-                        config.logger.info(' {0}'.format(f))
-                    temp_in.extend(sliced_files)
+    def handle_input(in_, in_key, formatter_key):
+        formatter_inputs, simple_inputs, generator_inputs = \
+            aggregate_task_inputs(
+                ensure_list(task.get(in_, []), tuple_as_list=False))
+        if len(generator_inputs) > 0:  # generator_inputs goes to unnamed arg
+                task_args.extend(generator_inputs)
+        # simple_inputs get common general formatter
+        if len(simple_inputs) > 0:
+            formatter_inputs.append((simple_inputs, r'.+'))
+        # handle formatter_inputs
+        task_inputs = []
+        task_formatters = []
+        for in_, reg in formatter_inputs:
+            in_ = [i['name'] if isinstance(i, dict) else i
+                   for i in ensure_list(in_)]
+            temp_in = []
+            temp_reg = reg
+            for i in in_:
+                if i in task_name_list:
+                    temp_in.append(output_from(i))
+                    continue
+                elif not os.path.isabs(i):  # prepend default io dir
+                    i = os.path.join(config.task_io_default_dir, i)
+                    temp_reg = r'(?:[^/]*/)*' + reg
                 else:
-                    config.logger.info('glob input: {0}'.format(i))
+                    pass
+                if re.search(r'[?*,\[\]{}]', i) is not None:
+                    # slice on flagged task with glob input
+                    if config.slice_test is not None \
+                            and task.get('allow_slice', False):
+                        config.logger.info(
+                                'sliced glob input: {0} @ {1}'.format(
+                                    i, ', '.join(map(str, config.slice_test))))
+                        sliced_files = sliced_glob(i, config.slice_test)
+                        if len(sliced_files) == 0:
+                            raise RuntimeError('no input left after slicing')
+                        for f in sliced_files:
+                            config.logger.info(' {0}'.format(f))
+                        temp_in.extend(sliced_files)
+                    else:
+                        config.logger.info('glob input: {0}'.format(i))
+                        temp_in.append(i)
+                else:
+                    config.logger.info('file input: {0}'.format(i))
                     temp_in.append(i)
-            else:
-                config.logger.info('file input: {0}'.format(i))
-                temp_in.append(i)
-        task_inputs.append(temp_in)  # list of list
-        task_formatters.append(temp_reg)  # list of regex
-    if len(task_inputs) > 0:
-        task_inputs = reduce(lambda a, b: a + b, task_inputs)  # flatten
+            task_inputs.append(temp_in)  # list of list
+            task_formatters.append(temp_reg)  # list of regex
         if len(task_inputs) > 0:
-            task_kwargs['input'] = unwrap_if_len_one(task_inputs)
-        if task['pipe'] != 'merge':  # require formatter for non-merge pipe
-            task_kwargs['filter'] = formatter(*task_formatters)
+            task_inputs = reduce(lambda a, b: a + b, task_inputs)  # flatten
+            if len(task_inputs) > 0:
+                task_kwargs[in_key] = unwrap_if_len_one(task_inputs)
+            if task['pipe'] != 'merge':  # require formatter for non-merge pipe
+                task_kwargs[formatter_key] = formatter(*task_formatters)
+    handle_input('in_', 'input', 'filter')
+    if 'in2' in task.keys():
+        handle_input('in2', 'input2', 'filter2')
 
     def resolve_task_name(s):
         if isinstance(s, dict):
@@ -374,7 +381,7 @@ def create_ruffus_task(pipe, config, task, **kwargs):
             task_extras.append(extra)
     # context is parameters that are passed to the task function
     context_exclude_task_keys = [
-            'pipe', 'in_', 'out', 'add_inputs', 'allow_slice']
+            'in_', 'out', 'add_inputs', 'allow_slice']
     context_key_defaults = {
             'verbose': True,
             'dry_run': False,
@@ -475,24 +482,38 @@ def build_pipeline(config, option):
     return pipe
 
 
-def bootstrap():
+def bootstrap(config=None, option=None):
     """entry point; parse command line argument, create pipeline object,
     and run it
     """
     print("+- APUS powered by Ruffus ver {0} -+".format(ruffus.__version__))
-    config, option = configure(sys.modules['__main__'], sys.argv[1:])
+    if config is None:
+        config = sys.modules['__main__']
+    if option is None:
+        option = sys.argv[1:]
+    config, option = configure(config, option)
     # set up env with overrides
     env.am.set_overrides(config.env_overrides)
+
     # check existence of the jobdir
+    def has_logdir():
+        if not os.path.exists(config.logdir):
+            utils.get_or_create_dir(config.logdir)
+        return os.path.exists(config.logdir)
     if option.action == 'run':
         if not os.path.exists(config.jobdir):
             raise RuntimeError('job directory does not exist,'
                                ' run init to create one')
+        elif not has_logdir():
+            raise RuntimeError('unable to find/create log directory')
         else:
             build_pipeline(config, option)
     elif option.action == 'init':
         option.history_file = option.history_file + '.init'
-        build_init_pipeline(config, option)
+        if not has_logdir():
+            raise RuntimeError('unable to find/create log directory')
+        else:
+            build_init_pipeline(config, option)
     # handle redo-all
     if option.redo_all:
         task_list = ruffus.pipeline_get_task_names()
@@ -568,6 +589,10 @@ def logger_factory(logger_name, args):
 def task_finish_signal(task_name, config):
     """print task execution time upon finishing"""
     def ret_task_finish_signal():
+        # refresh flowchart
+        # subprocess.call(['python', sys.argv[0],
+        #                  '-T', config.tlist[-1]['name'],
+        #                  '--flowchart', 'test.png'])
         with config.logger_mutex:
             elapsed_time = timedelta(
                     seconds=time.time() - config.timestamp)
@@ -764,13 +789,18 @@ def callable_task(in_files, out_files, context):
         caller_string = "{0}({1})".format(func.__name__, ', '.join(args))
     if dry_run:
         caller_string = "~dry~run~1~sec: " + caller_string
-    if verbose:
+    if verbose or dry_run:
         with logger_mutex:
             logger.debug(caller_string)
     if dry_run:
         time.sleep(1)
-        map(common.touch_file, out_files)
-        output = '~dry~run~touched: {0}'.format(', '.join(out_files))
+        # fix dry_run for originate
+        if task['pipe'] == 'originate':
+            touch_files = in_files + out_files
+        else:
+            touch_files = out_files
+        map(common.touch_file, touch_files)
+        output = '~dry~run~touched: {0}'.format(', '.join(touch_files))
     else:
         kwargs = dict(
                 task['kwargs'],
@@ -856,9 +886,14 @@ def check_config_uptodate(*args, **kwargs):
         if not os.path.isfile(f):
             return True, "missing file {0}".format(f)
     task = context['task']
+    if task['dry_run']:
+        return False, "skipped checker due to dry run"
     with open(checker_file, 'r') as fo:
-        old_params = pickle.load(fo)
-        old_outparams = pickle.load(fo)
+        try:
+            old_params = pickle.load(fo)
+            old_outparams = pickle.load(fo)
+        except EOFError:
+            return True, "corrupted checker"
     new_params = task.get('params', {})
     new_outparams = task.get('outparams', [])
     if len(new_params) != len(old_params) or \

@@ -12,7 +12,10 @@ Provide various helper functions
 
 import re
 import os
+import sys
 import glob
+import core
+import inspect
 import logging
 import logging.config
 
@@ -66,7 +69,7 @@ def parse_astromatic_conf(*conf_files):
                     continue
                 else:
                     key, rest = map(str.strip, ln.split(None, 1))
-                    value = rest.split('#')[0]
+                    value = map(str.strip, rest.split('#'))[0]
                     params[key] = value
     return params
 
@@ -198,3 +201,51 @@ def join_tlist(*args):
         raise RuntimeError("need at least two tlists to join")
     else:
         return join_tlist(join_tlist(*args[:-1]), args[-1])
+
+
+def get_main_config():
+    '''useful when split config file to several modules'''
+    return sys.modules['__main__']
+
+
+def default_to_main_config(func):
+    '''replace function args with main config keys if not specified'''
+    def wrapped_func(*args, **kwargs):
+        conf = get_main_config()
+        args = list(args)
+        fargs = inspect.getargspec(func).args
+        while len(args) < len(fargs):
+            args.append(None)
+        for i, (a, f) in enumerate(zip(args, fargs)):
+            if a is None and hasattr(conf, f):
+                fargs[i] = getattr(conf, f)
+            else:
+                fargs[i] = a
+        return func(*fargs)
+    return wrapped_func
+
+
+def tlist_wrapper(tlist, outglob, outreg):
+    return ApusTaskList(tlist, outglob, outreg)
+
+
+class ApusTaskList(object):
+    '''provide interface for chaining multiple task lists'''
+
+    def __init__(self, tlist, outglob, outreg):
+
+        self.config = get_main_config()
+        if hasattr(self.config, 'tlist'):
+            head_follows = core.ensure_list(tlist[0].get('follows', None))
+            head_follows.append(self.config.tlist[-1])
+            head_task = dict(tlist[0], follows=head_follows)
+            self.config.tlist.append(head_task)
+            self.config.tlist.extend(tlist[1:])
+        else:
+            self.config.tlist = tlist
+        self.outglob = outglob
+        self.outreg = outreg
+
+    def chain(self, tlist_func):
+        other = tlist_func(self.outglob, self.outreg)
+        return other
