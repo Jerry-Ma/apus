@@ -16,15 +16,16 @@ import numpy as np
 from astropy.table import Table
 from astropy.table import Column
 import sys
-import os
+# import os
 
 
 if __name__ == "__main__":
     band = sys.argv[1]
     lolim, uplim = map(float, sys.argv[2:4])
     in_ = sys.argv[4]
-    out = sys.argv[5]
-    inwcs = '{0}.wcs'.format(os.path.splitext(in_)[0])
+    inwcs = sys.argv[5]
+    out = sys.argv[6]
+    # inwcs = '{0}.wcs'.format(os.path.splitext(in_)[0])
     tbl = Table.read(in_, format='ascii.commented_header')
     obsdate = Column([2000.2586] * len(tbl), name='OBSDATE')
     tbl.add_column(obsdate)

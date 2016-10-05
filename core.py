@@ -93,6 +93,7 @@ class ApusConfig(object):
                     val = defval.format(**self.__dict__)
                 else:
                     val = defval
+                setattr(config, key, val)
             setattr(self, key, val)
 
     def get_dirs(self):
@@ -145,6 +146,18 @@ def configure(config, args):
             )
     option = parser.parse_args(args)
     # handle logger
+    # check existence of the jobdir
+
+    def has_logdir():
+        if not apusconf.logdir:
+            return True
+        elif not os.path.exists(apusconf.logdir):
+            utils.get_or_create_dir(apusconf.logdir)
+            return os.path.exists(apusconf.logdir)
+        else:
+            return True
+    if not has_logdir():
+        raise RuntimeError('unable to find/create log directory')
     logger, logger_mutex = make_shared_logger_and_proxy(
             logger_factory, apusconf.jobkey, [option.log_file, option.verbose])
     apusconf.logger = logger
@@ -276,11 +289,22 @@ def create_ruffus_task(pipe, config, task, **kwargs):
                 pipe, config, pre_task, task_io_default_dir='')
             task_follows.append(pre_task['name'])
             # connect pre_task to this
-            conf_inputs = task.get('extras', [])
+            # conf_inputs = task.get('extras', [])
+            # conf_inputs.append(os.path.abspath(pre_task['out']))
+            # task_inkeys.append('conf')
+            conf_inputs = ensure_list(task.get('add_inputs', None))
             conf_inputs.append(os.path.abspath(pre_task['out']))
-            task_inkeys = task.get('in_keys', ['in', ])
-            task_inkeys.append('conf')
-            task['extras'] = conf_inputs
+            task_inkeys = copy(task.get('in_keys', ['in', ]))
+            _inkeys = ['in', 'in+']
+            for i, key in enumerate(task_inkeys):
+                if key in _inkeys:
+                    task_inkeys[i] = (key, 'conf')
+                    break
+                elif isinstance(key, tuple) and \
+                        any(j in _inkeys for j in key):
+                    task_inkeys[i] = key + ('conf', )
+                    break
+            task['add_inputs'] = conf_inputs
             task['in_keys'] = task_inkeys
 
     # handle input
@@ -324,10 +348,12 @@ def create_ruffus_task(pipe, config, task, **kwargs):
                             config.logger.info(' {0}'.format(f))
                         temp_in.extend(sliced_files)
                     else:
-                        config.logger.info('glob input: {0}'.format(i))
+                        config.logger.info('{0:^27s} (glob): {1}'.format(
+                            task_name, i))
                         temp_in.append(i)
                 else:
-                    config.logger.info('file input: {0}'.format(i))
+                    config.logger.info('{0:^27s} (file): {1}'.format(
+                        task_name, i))
                     temp_in.append(i)
             task_inputs.append(temp_in)  # list of list
             task_formatters.append(temp_reg)  # list of regex
@@ -495,25 +521,15 @@ def bootstrap(config=None, option=None):
     # set up env with overrides
     env.am.set_overrides(config.env_overrides)
 
-    # check existence of the jobdir
-    def has_logdir():
-        if not os.path.exists(config.logdir):
-            utils.get_or_create_dir(config.logdir)
-        return os.path.exists(config.logdir)
     if option.action == 'run':
         if not os.path.exists(config.jobdir):
             raise RuntimeError('job directory does not exist,'
                                ' run init to create one')
-        elif not has_logdir():
-            raise RuntimeError('unable to find/create log directory')
         else:
             build_pipeline(config, option)
     elif option.action == 'init':
         option.history_file = option.history_file + '.init'
-        if not has_logdir():
-            raise RuntimeError('unable to find/create log directory')
-        else:
-            build_init_pipeline(config, option)
+        build_init_pipeline(config, option)
     # handle redo-all
     if option.redo_all:
         task_list = ruffus.pipeline_get_task_names()
@@ -605,9 +621,9 @@ def task_finish_signal(task_name, config):
 
 def get_flag_file(out_files):
     suffix = '.success'
-    if len(out_files) == 1 and out_files[0][-len(suffix):] == suffix:
+    if len(out_files) >= 1 and out_files[-1][-len(suffix):] == suffix:
         flag = out_files[0]
-        out_files = []
+        out_files = out_files[:-1]
     else:
         flag = None
     return out_files, flag
@@ -657,13 +673,14 @@ def to_callable_task_args(conv_func):
 
 
 def _subprocess_callable(in_files, out_files, context):
-    if any(isinstance(i, tuple) for i in in_files):
-        if len(in_files) > 1:
-            # raise RuntimeError(
-            #     "subprocess task should not have nested inputs")
-            in_files = [i for j in in_files for i in j]
+    # split tuples from string
+    flattened_files = []
+    for in_ in in_files:
+        if isinstance(in_, tuple):
+            flattened_files.extend(list(in_))
         else:
-            in_files = in_files[0]
+            flattened_files.append(in_)
+    in_files = flattened_files
     command = context['task']['func'].split()
     for key, value in zip(['{in}', '{out}'], [in_files, out_files]):
         if key in command:
@@ -700,11 +717,13 @@ def _astromatic_callable(in_files, out_files, context):
             else:
                 command.extend(['-c', val[0]])
                 params.update(utils.parse_astromatic_conf(*val[1:]))
+        elif key == 'dummy':
+            pass
         else:  # values should be concat by comma
-            params[key] = ','.join(val)
+            params[key] = ', '.join(val)
     params.update(task.get('params', {}))
     for key, val in params.items():
-        command.extend(['-{0}'.format(key), '"{0}"'.format(val)])
+        command.extend(['-{0}'.format(key), "{0}".format(val)])
     # handle outkeys
     default_outkeys = {
             'sex': ['CATALOG_NAME', ],
@@ -743,19 +762,32 @@ def get_astromatic_inputs(inputs, in_keys):
     #   [(key1, [in1, in2, .. ]), (key2, [add1_1, add1_2 ..])
     ret_keys = []
     ret_vals = []
+    # expand in+
+    if 'in+' in in_keys:
+        nin = len(inputs) - len(in_keys)
+        iin = in_keys.index('in+')
+        # print("expand in+ to")
+        in_keys[iin:iin + 1] = ['in', ] * (nin + 1)
     # first level zip for exkeys
     for key, val in zip(in_keys, inputs):
         if isinstance(key, tuple):  # deal with tuple keys:
             if all(isinstance(v, tuple) for v in val):
                 val = zip(*val)  # tuple of tuple, need to be zipped
             if len(key) == len(val):
-                ret_keys.extend(key)
-                ret_vals.extend(val)
+                for k, vv in zip(key, val):
+                    if isinstance(vv, tuple):
+                        vv = tuple(set(vv))
+                        vv = vv[0] if len(vv) == 1 else vv
+                    ret_keys.append(k)
+                    ret_vals.append(vv)
             else:
                 raise RuntimeError(
                     "mismatched number of"
                     " keys ({0}) and inputs {1}".format(len(key), len(val)))
         else:
+            val = unwrap_if_len_one(val)
+            if isinstance(val, str) and re.search('[*?]', val) is not None:
+                val = tuple(glob.glob(val))
             ret_keys.append(key)
             ret_vals.append(val)
     # aggregate duplicated keys
@@ -916,15 +948,15 @@ def check_config_uptodate(*args, **kwargs):
 def documented_subprocess_call(command, flag_file=None):
     def call(*args, **kwargs):
         # handle scamp refcatalog suffix
-        if '-ASTREFCAT_NAME' in command:
-            ikey = command.index('-ASTREFCAT_NAME') + 1
-            refcatkey = command[ikey]
-            refcatfiles = glob.glob(
-                    "{0}_?{1}".format(*os.path.splitext(refcatkey)))
-            if len(refcatfiles) == 0:
-                refcatfiles = glob.glob(refcatkey)
-            if len(refcatfiles) > 0:
-                command[ikey] = ','.join(refcatfiles)
+        # if '-ASTREFCAT_NAME' in command:
+        #     ikey = command.index('-ASTREFCAT_NAME') + 1
+        #     refcatkey = command[ikey]
+        #     refcatfiles = glob.glob(
+        #             "{0}_?{1}".format(*os.path.splitext(refcatkey)))
+        #     if len(refcatfiles) == 0:
+        #         refcatfiles = glob.glob(refcatkey)
+        #     if len(refcatfiles) > 0:
+        #         command[ikey] = ','.join(refcatfiles)
         log = common.get_log_func(**kwargs)
 
         # with NamedTemporaryFile() as fo:
@@ -955,5 +987,7 @@ def documented_subprocess_call(command, flag_file=None):
         return has_output
         # return output
     # print(' '.join(command))
-    call.__doc__ = 'subprocess: ' + ' '.join(command)
+    # quote items with string
+    call.__doc__ = 'subprocess: ' + ' '.join(
+            ['"{0}"'.format(c) if ' ' in c else c for c in command])
     return call

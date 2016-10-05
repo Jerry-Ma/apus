@@ -18,6 +18,7 @@ import core
 import inspect
 import logging
 import logging.config
+from ruffus import needs_update_check_modify_time
 
 
 def update_progress(mesg, perc):
@@ -249,3 +250,9 @@ class ApusTaskList(object):
     def chain(self, tlist_func):
         other = tlist_func(self.outglob, self.outreg)
         return other
+
+
+def apus_check_if_uptodate(*args, **kwargs):
+    conf = get_main_config()
+    return needs_update_check_modify_time(
+            *args, job_history=conf.history_file, **kwargs)
