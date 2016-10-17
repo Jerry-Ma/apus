@@ -44,8 +44,10 @@ def get_ldac_object(tbl):
     outunt = ['deg', 'deg', 'deg', 'deg',
               'deg', 'deg', 'deg', 'deg', 'deg',
               'deg', 'deg', None]
+    # TODO figure out why is the sex catalog column name truncated
+    fix_colname = None if 'ERRAWIN_IMAGE' in tbl.colnames else 15
     datahdu = fits.BinTableHDU.from_columns(
-        [fits.Column(name=k, format=f, array=tbl[k[:15]], unit=u)
+        [fits.Column(name=k, format=f, array=tbl[k[:fix_colname]], unit=u)
          for k, f, u in zip(outkey, outfmt, outunt)])
     datahdu.header['EXTNAME'] = 'LDAC_OBJECTS'
     return datahdu
