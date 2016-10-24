@@ -128,6 +128,9 @@ def configure(config, args):
     parser.add_argument(
             '-d', '--dry-run', action='store_true',
             help='perform low level dry run for debugging purpose')
+    parser.add_argument(
+            '-l', '--list-tasks', action='store_true',
+            help='list the task names and exit')
 
     def input_slice(string):
         if '...' in string:
@@ -518,6 +521,11 @@ def bootstrap(config=None, option=None):
     if option is None:
         option = sys.argv[1:]
     config, option = configure(config, option)
+    if option.list_tasks:
+        tlist = config.get_task_names()
+        for t in tlist:
+            print("{0}".format(t))
+        sys.exit(0)
     # set up env with overrides
     env.am.set_overrides(config.env_overrides)
 
