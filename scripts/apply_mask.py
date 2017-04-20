@@ -19,6 +19,7 @@ if __name__ == "__main__":
     hlin = fits.open(in_)
     hlwht = fits.open(wht)
     for i in range(len(hlin)):
-        badmask = hlwht[i].data == 0
-        hlin[i].data[badmask] = np.nan
-    hlin.writeto(out, clobber=True)
+        if isinstance(hlin[i], (fits.PrimaryHDU, fits.ImageHDU)):
+            badmask = hlwht[i].data == 0
+            hlin[i].data[badmask] = np.nan
+    hlin.writeto(out, overwrite=True)

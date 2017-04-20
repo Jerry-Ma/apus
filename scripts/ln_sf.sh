@@ -11,5 +11,13 @@
 #----------------------------------------------------------------------------
 
 
-echo ln -sf $(readlink -m $1) $2
-ln -sf $(readlink -m $1) $2
+readlink=$(which greadlink)
+if [[ ! $readlink ]]; then
+    readlink='which readlink'
+fi
+src=$1
+shift
+for tar in $@; do
+    echo ln -sf $($readlink -m $src) $tar
+    ln -sf $($readlink -m $src) $tar
+done
