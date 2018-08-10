@@ -22,6 +22,7 @@ import subprocess
 from copy import copy
 from functools import wraps    # enable pickling of decorator
 from datetime import timedelta
+from functools import reduce
 # from collections import Iterable
 # from tempfile import NamedTemporaryFile
 
@@ -270,7 +271,8 @@ def create_ruffus_task(pipe, config, task, **kwargs):
     if task_func.__name__ == 'astromatic_task':
         task['params'] = normalize_am_params(task.get('params', {}))
         # generate configuration file if not supplied
-        if 'conf' not in ensure_list(task.get('in_keys', None)):
+        if 'conf' not in ensure_list(task.get('in_keys', None)) or \
+                task.get('auto_conf', False):
             pre_task = {
                 'name': 'auto config {0}'.format(task_name),
                 'func': dump_config_files,
@@ -295,10 +297,14 @@ def create_ruffus_task(pipe, config, task, **kwargs):
             # conf_inputs = task.get('extras', [])
             # conf_inputs.append(os.path.abspath(pre_task['out']))
             # task_inkeys.append('conf')
-            conf_inputs = ensure_list(task.get('add_inputs', None))
+            if 'replace_inputs' in task.keys():
+                _inputs_key = 'replace_inputs'
+            else:
+                _inputs_key = 'add_inputs'
+            conf_inputs = ensure_list(task.get(_inputs_key, None))
             conf_inputs.append(os.path.abspath(pre_task['out']))
             task_inkeys = copy(task.get('in_keys', ['in', ]))
-            _inkeys = ['in', 'in+']
+            _inkeys = ['in', 'in+', 'in*']
             for i, key in enumerate(task_inkeys):
                 if key in _inkeys:
                     task_inkeys[i] = (key, 'conf')
@@ -307,7 +313,7 @@ def create_ruffus_task(pipe, config, task, **kwargs):
                         any(j in _inkeys for j in key):
                     task_inkeys[i] = key + ('conf', )
                     break
-            task['add_inputs'] = conf_inputs
+            task[_inputs_key] = conf_inputs
             task['in_keys'] = task_inkeys
 
     # handle input
@@ -664,7 +670,8 @@ def to_callable_task_args(conv_func):
                 in_files, out_files, extras = [], in_files, out_files
             in_files += extras[:-1]
             out_files, flag_file = get_flag_file(out_files)
-            overlap = list(set(in_files).intersection(out_files))
+            # print(in_files, out_files)
+            overlap = list(set(in_files).intersection(set(out_files)))
             if len(overlap) > 0:
                 raise RuntimeError(
                         'danger: output {0} has same filename as inputs'
@@ -728,7 +735,7 @@ def _astromatic_callable(in_files, out_files, context):
         elif key == 'dummy':
             pass
         else:  # values should be concat by comma
-            params[key] = ', '.join(val)
+            params[key] = ','.join(val)
     params.update(task.get('params', {}))
     for key, val in params.items():
         command.extend(['-{0}'.format(key), "{0}".format(val)])
@@ -781,11 +788,17 @@ def get_astromatic_inputs(inputs, in_keys):
         if isinstance(key, tuple):  # deal with tuple keys:
             if all(isinstance(v, tuple) for v in val):
                 val = zip(*val)  # tuple of tuple, need to be zipped
+            # expand in*
+            if 'in*' in key:
+                _key = list(key)
+                _i = _key.index('in*')
+                _key[_i:_i + 1] = ['in', ] * (len(val) - len(key) + 1)
+                key = tuple(_key)
             if len(key) == len(val):
                 for k, vv in zip(key, val):
                     if isinstance(vv, tuple):
-                        vv = tuple(set(vv))
-                        vv = vv[0] if len(vv) == 1 else vv
+                        _v = tuple(set(vv))
+                        vv = _v[0] if len(_v) == 1 else vv
                     ret_keys.append(k)
                     ret_vals.append(vv)
             else:

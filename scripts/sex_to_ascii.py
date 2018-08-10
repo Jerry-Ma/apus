@@ -13,4 +13,4 @@ if __name__ == "__main__":
     import sys
     from astropy.table import Table
     tbl = Table.read(sys.argv[1], format='ascii.sextractor')
-    tbl.write(sys.argv[2], format='ascii.commented_header')
+    tbl.write(sys.argv[2], format='ascii.commented_header', overwrite=True)

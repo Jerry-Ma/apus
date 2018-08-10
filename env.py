@@ -54,8 +54,8 @@ class AmConfig(object):
             }
     swarp_default = {
             'INTERPOLATE': 'N',
-            'FSCALASTRO_TYPE': 'VARIABLE',
-            'DELETE_TMPFILES': 'N',
+            'FSCALASTRO_TYPE': 'FIXED',
+            'DELETE_TMPFILES': 'Y',
             'NOPENFILES_MAX': '1000000',
             'WRITE_XML': 'N',
             }
