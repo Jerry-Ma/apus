@@ -428,7 +428,7 @@ def create_ruffus_task(pipe, config, task, **kwargs):
         context[key] = task.get(key, defval)
     if config.dry_run:
         context['dry_run'] = True
-    if 'follows' in context.keys():
+    if 'follows' in context.keys() and len(task_follows) > 0:
         # for cleaner debug info
         context['follows'] = unwrap_if_len_one(task_follows)
     task_context = {
